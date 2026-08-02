@@ -5,11 +5,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY ingest/ ./ingest/
 COPY api/ ./api/
 
-# Which process this container runs is picked at deploy time via CMD
-# override in wrangler.toml's [[containers]] block -- same image serves
-# the ingest endpoint, the read API, and the worker, so there's one
-# image to build/push, not three.
+# ingest/ (queue.py + worker.py) is the SQS-based design from the
+# original spec, kept for when actual durability/backpressure needs it
+# -- not currently in the deployed path. api.main includes both read
+# and ingest endpoints, writing directly to Postgres. See api/main.py's
+# header comment for why.
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8080"]

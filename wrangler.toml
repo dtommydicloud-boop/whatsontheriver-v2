@@ -1,11 +1,8 @@
 # Cloudflare Containers deployment config for the whatsontheriver v2
-# cloud-side services (ingest API, read API). Written 2026-08-02 against
-# the account's confirmed Containers/Cloudchamber access -- NOT yet
-# deployed or end-to-end tested (blocked on the Neon Postgres connection
-# string). Verify field names against current `wrangler containers` docs
-# before running `wrangler deploy` for real, since this is a newer
-# Cloudflare product and the config shape may have moved since this was
-# written.
+# cloud-side services (ingest API, read API). Real Neon DATABASE_URL
+# secret is live (uploaded 2026-08-02 via `wrangler secret put`) and the
+# schema is applied and verified against the actual database -- this is
+# no longer purely theoretical, next step is the real `wrangler deploy`.
 
 name = "whatsontheriver-api"
 main = "worker/index.ts"
@@ -14,8 +11,8 @@ compatibility_date = "2026-08-01"
 [[containers]]
 class_name = "WhatsOnTheRiverAPI"
 image = "./Dockerfile"
-instances = 1
-# TODO once traffic is real: bump instances for the "two computers"
+max_instances = 1
+# TODO once traffic is real: bump max_instances for the "two computers"
 # redundancy Tom asked about -- this is where that lives, a config
 # number, not a rebuild.
 

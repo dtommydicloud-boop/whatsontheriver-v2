@@ -89,17 +89,29 @@ CREATE TABLE derived_eta (
 );
 SELECT create_hypertable('derived_eta', 'computed_at');
 
--- Retention: raw stays 90 days (forensic window), typed positions
--- compressed after 30 days, kept 1 year. Aggregates (below) live forever.
-SELECT add_retention_policy('telemetry_raw', INTERVAL '90 days');
-SELECT add_retention_policy('vessel_position', INTERVAL '365 days');
-ALTER TABLE vessel_position SET (timescaledb.compress, timescaledb.compress_segmentby = 'mmsi');
-SELECT add_compression_policy('vessel_position', INTERVAL '30 days');
+-- Real constraint found applying this schema 2026-08-02: Neon's
+-- TimescaleDB extension is the Apache-2.0 build only -- hypertables
+-- (create_hypertable, above) work fine, but retention POLICIES,
+-- native COMPRESSION, and CONTINUOUS aggregates are all gated behind
+-- the commercial "timescale" license (Timescale Cloud only), not
+-- available here. Confirmed by testing directly against this database,
+-- not assumed from docs. At our real current volume (~300-400k
+-- events/day per Reed's measurement) this isn't a functional blocker --
+-- it just means retention/rollups are a manual/cron job instead of a
+-- built-in policy for now. Revisit if we ever move to Timescale Cloud
+-- itself, or if raw-table size becomes a real problem before then.
 
--- Continuous aggregate powering the traffic-heatmap endpoint — replaces
--- the daily cron job that builds this today.
-CREATE MATERIALIZED VIEW heatmap_1h
-WITH (timescaledb.continuous) AS
+-- Retention: no automatic policy available -- run a scheduled DELETE
+-- instead (cron hitting a small maintenance endpoint, or pg_cron if
+-- Neon ever supports it). Not wired up yet; raw data will just
+-- accumulate until this is added -- fine short-term at this volume,
+-- revisit before it isn't.
+
+-- Heatmap: plain (non-materialized) view instead of a continuous
+-- aggregate. At current volume this computes fast enough to just query
+-- live -- swap to a materialized view + manual REFRESH on a schedule
+-- if lock_status_observation grows large enough that this gets slow.
+CREATE VIEW heatmap_1h AS
 SELECT
     time_bucket('1 hour', time) AS bucket,
     lock_id,
@@ -107,8 +119,3 @@ SELECT
     avg(barges) AS avg_barges
 FROM lock_status_observation
 GROUP BY bucket, lock_id;
-
-SELECT add_continuous_aggregate_policy('heatmap_1h',
-    start_offset => INTERVAL '3 days',
-    end_offset   => INTERVAL '1 hour',
-    schedule_interval => INTERVAL '1 hour');
