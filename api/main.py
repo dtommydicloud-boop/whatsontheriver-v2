@@ -32,9 +32,20 @@ from datetime import datetime, timezone
 
 import asyncpg
 from fastapi import FastAPI, Header, HTTPException, Request
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
 
 app = FastAPI(title="whatsontheriver API")
+
+# whatsontheriver.com calls this from the browser (photo submissions,
+# eventually the live read endpoints too) -- needs real CORS, not the
+# default same-origin-only behavior.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://whatsontheriver.com", "https://www.whatsontheriver.com"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 LOCK_META = {
     # TODO: move to a `locks` reference table once Track C is proven;
@@ -247,6 +258,56 @@ async def ingest(request: Request, x_signature: str = Header(...)):
                 await write_event(conn, batch.source_id, event)
 
     return {"accepted": len(batch.events)}
+
+
+# --- Photo submissions ---------------------------------------------------
+# Real note on the storage choice: photos are stored as base64 in Postgres,
+# not object storage (R2/S3). This is an honest interim call, not an
+# oversight -- we don't have R2 access provisioned yet, and at low
+# submission volume this is genuinely fine (Neon free tier is 500MB).
+# Revisit if/when this becomes a real bottleneck, not before.
+MAX_PHOTO_BYTES = 6_000_000  # ~6MB raw, keeps base64-inflated size sane
+ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp"}
+
+
+class PhotoSubmission(BaseModel):
+    vessel_name: str
+    photographer_name: str
+    credit_name: str
+    contact_email: EmailStr
+    message: str | None = None
+    photo_data_b64: str
+    photo_mime: str
+    agreed: bool
+
+
+@app.post("/photo-submissions")
+async def submit_photo(sub: PhotoSubmission):
+    if not sub.agreed:
+        raise HTTPException(400, "must agree to the terms to submit")
+    if sub.photo_mime not in ALLOWED_MIME:
+        raise HTTPException(400, f"photo must be one of {sorted(ALLOWED_MIME)}")
+    # base64 is ~4/3 the size of the raw bytes -- check the encoded length
+    # directly rather than decoding first, cheaper and just as accurate
+    # for a size gate.
+    if len(sub.photo_data_b64) > MAX_PHOTO_BYTES * 4 // 3:
+        raise HTTPException(400, "photo too large -- please keep it under 6MB")
+    if not sub.vessel_name.strip() or not sub.photographer_name.strip() or not sub.credit_name.strip():
+        raise HTTPException(400, "vessel name, your name, and credit name are all required")
+
+    async with app.state.pool.acquire() as conn:
+        row_id = await conn.fetchval(
+            """
+            INSERT INTO photo_submissions (vessel_name, photographer_name, credit_name,
+                                            contact_email, message, photo_data_b64, photo_mime, agreed_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+            RETURNING id
+            """,
+            sub.vessel_name.strip(), sub.photographer_name.strip(), sub.credit_name.strip(),
+            sub.contact_email, sub.message, sub.photo_data_b64, sub.photo_mime,
+        )
+
+    return {"submitted": True, "id": row_id}
 
 
 @app.get("/healthz")
