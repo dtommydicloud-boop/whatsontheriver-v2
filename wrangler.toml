@@ -1,0 +1,33 @@
+# Cloudflare Containers deployment config for the whatsontheriver v2
+# cloud-side services (ingest API, read API). Written 2026-08-02 against
+# the account's confirmed Containers/Cloudchamber access -- NOT yet
+# deployed or end-to-end tested (blocked on the Neon Postgres connection
+# string). Verify field names against current `wrangler containers` docs
+# before running `wrangler deploy` for real, since this is a newer
+# Cloudflare product and the config shape may have moved since this was
+# written.
+
+name = "whatsontheriver-api"
+main = "worker/index.ts"
+compatibility_date = "2026-08-01"
+
+[[containers]]
+class_name = "WhatsOnTheRiverAPI"
+image = "./Dockerfile"
+instances = 1
+# TODO once traffic is real: bump instances for the "two computers"
+# redundancy Tom asked about -- this is where that lives, a config
+# number, not a rebuild.
+
+[[durable_objects.bindings]]
+name = "API_CONTAINER"
+class_name = "WhatsOnTheRiverAPI"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WhatsOnTheRiverAPI"]
+
+[vars]
+# Non-secret config only. DATABASE_URL, SQS creds, and per-source HMAC
+# secrets go in via `wrangler secret put`, never committed here.
+FRESH_CUTOFF_S = "300"
