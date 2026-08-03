@@ -74,6 +74,27 @@ SOURCE_SECRETS: dict[str, str] = {
 @app.on_event("startup")
 async def startup():
     app.state.pool = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=2, max_size=10)
+    async with app.state.pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS email_signups (
+                id         BIGSERIAL PRIMARY KEY,
+                email      TEXT NOT NULL UNIQUE,
+                site       TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+
+
+GHOST_WINDOW_S = 6 * 3600  # real bug found comparing against production
+# 2026-08-03: this endpoint returned every vessel we'd ever ingested,
+# including ones over 100 hours stale -- the production site never did
+# this, it only shows a vessel if it's genuinely live OR lock-projected
+# (a different, always-current tier this API doesn't build yet). Until
+# lock-projection is ported here, match production's real behavior by
+# dropping anything older than a 6h ghost window instead of showing
+# every vessel this system has ever heard from.
 
 
 @app.get("/live-positions")
@@ -84,8 +105,10 @@ async def live_positions():
             """
             SELECT mmsi, name, last_seen, last_lat, last_lon, last_source_id, quality
             FROM vessel_current_state
+            WHERE last_seen > now() - make_interval(secs => $1)
             ORDER BY last_seen DESC
-            """
+            """,
+            GHOST_WINDOW_S,
         )
 
     vessels = []
@@ -308,6 +331,30 @@ async def submit_photo(sub: PhotoSubmission):
         )
 
     return {"submitted": True, "id": row_id}
+
+
+# --- Email signup ---------------------------------------------------------
+# This route existed on the OLD worker deployed at this same name before the
+# Track C rebuild -- deploying the new container-based worker over it silently
+# dropped it (the site's landing-page signup form kept calling it and got
+# 404s). Restoring it here, backed by its own table.
+class SignupRequest(BaseModel):
+    email: EmailStr
+    site: str | None = None
+
+
+@app.post("/signup")
+async def signup(req: SignupRequest):
+    async with app.state.pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO email_signups (email, site)
+            VALUES ($1, $2)
+            ON CONFLICT (email) DO NOTHING
+            """,
+            req.email, req.site,
+        )
+    return {"signed_up": True}
 
 
 @app.get("/healthz")
