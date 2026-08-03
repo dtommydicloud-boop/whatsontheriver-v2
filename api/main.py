@@ -26,9 +26,10 @@ drop-in replacement, don't ship it silently missing.
 import hashlib
 import hmac
 import json
+import math
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import asyncpg
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -48,16 +49,43 @@ app.add_middleware(
 )
 
 LOCK_META = {
-    # TODO: move to a `locks` reference table once Track C is proven;
-    # hardcoded here only to get a working skeleton without another
-    # round-trip to Reed for the reference data.
+    # Exact match to lock-status.py's LOCKS/COVERED (Reed's original system) --
+    # ported straight across 2026-08-02, ping-tested against the same real
+    # USACE lockNumber/lockMile values, not re-guessed.
     "01": {"name": "St Paul", "river_mile": 847.6},
     "02": {"name": "Hastings", "river_mile": 815.2},
     "03": {"name": "Red Wing (Welch)", "river_mile": 796.9},
     "04": {"name": "Alma", "river_mile": 752.8},
     "05": {"name": "Minneiska", "river_mile": 738.1},
     "5A": {"name": "Winona", "river_mile": 728.5},
+    "06": {"name": "Trempealeau", "river_mile": 714.1},
+    "07": {"name": "La Crescent (Dresbach)", "river_mile": 702.5},
+    "08": {"name": "Genoa", "river_mile": 679.2},
+    "09": {"name": "Lynxville", "river_mile": 647.9},
+    "10": {"name": "Guttenberg", "river_mile": 615.1},
+    "11": {"name": "Dubuque", "river_mile": 583.0},
 }
+COVERED_LOCKS = list(LOCK_META.keys())
+
+# Ported straight from Reed's live-positions.py AIS_SOURCES -- receiver
+# coords used for distance/bearing-from-receiver, keyed by source_id so a
+# vessel's distance is measured from whichever antenna actually heard it.
+RECEIVERS = {
+    "lake_mac": {"lat": 44.489, "lon": -92.311, "name": "Lake Mac (Lake City MN)"},
+    "red_wing": {"lat": 44.56515, "lon": -92.54908, "name": "Ole Miss Marina (Red Wing MN)"},
+}
+
+# Ported from next-vessel.py's 4-anchor CENTERLINE + lat_lon_to_rm -- the
+# SIMPLE river-mile system used for the live/real-position tier (distinct
+# from Reed's channel-geojson-snapped system used for dead-reckoned/
+# lock-projected tiers, which isn't ported here yet -- see /live-positions
+# docstring below for the honest scope line on that).
+CENTERLINE = [
+    (44.7482, -92.8635, 815.2),  # Hastings L2
+    (44.6122, -92.6110, 796.9),  # Red Wing L3
+    (44.489, -92.311, 774.3),    # Lake Mac cabin (gate anchor)
+    (44.319, -92.056, 752.8),    # Alma L4
+]
 
 FRESH_CUTOFF_S = 300
 MAX_CLOCK_SKEW_S = 300  # reject ingest batches signed more than 5 min off
@@ -85,46 +113,161 @@ async def startup():
             )
             """
         )
+        # migrations/0002_lock_status_enrichment.sql, applied idempotently
+        # on boot (ADD COLUMN IF NOT EXISTS / CREATE TABLE IF NOT EXISTS
+        # throughout) rather than run out-of-band, so a deploy is never
+        # blocked on separately reaching the live Neon DB with a migration
+        # tool.
+        await conn.execute(
+            """
+            ALTER TABLE vessel_current_state ADD COLUMN IF NOT EXISTS sog_mph DOUBLE PRECISION;
+            ALTER TABLE vessel_current_state ADD COLUMN IF NOT EXISTS cog_deg DOUBLE PRECISION;
+            ALTER TABLE vessel_current_state ADD COLUMN IF NOT EXISTS heading_deg DOUBLE PRECISION;
+            ALTER TABLE vessel_current_state ADD COLUMN IF NOT EXISTS nav_status TEXT;
+            ALTER TABLE vessel_current_state ADD COLUMN IF NOT EXISTS shiptype INTEGER;
+            ALTER TABLE vessel_current_state ADD COLUMN IF NOT EXISTS is_commercial BOOLEAN;
+            ALTER TABLE vessel_current_state ADD COLUMN IF NOT EXISTS callsign TEXT;
+            ALTER TABLE vessel_current_state ADD COLUMN IF NOT EXISTS destination TEXT;
+            ALTER TABLE vessel_current_state ADD COLUMN IF NOT EXISTS draught DOUBLE PRECISION;
+
+            CREATE TABLE IF NOT EXISTS lock_live_state (
+                lock_id         TEXT PRIMARY KEY,
+                pending         INTEGER NOT NULL DEFAULT 0,
+                locking         INTEGER NOT NULL DEFAULT 0,
+                delay24h_min    INTEGER NOT NULL DEFAULT 0,
+                throughput_24h  INTEGER NOT NULL DEFAULT 0,
+                last_seen       TIMESTAMPTZ NOT NULL
+            );
+            """
+        )
 
 
-GHOST_WINDOW_S = 6 * 3600  # real bug found comparing against production
-# 2026-08-03: this endpoint returned every vessel we'd ever ingested,
-# including ones over 100 hours stale -- the production site never did
-# this, it only shows a vessel if it's genuinely live OR lock-projected
-# (a different, always-current tier this API doesn't build yet). Until
-# lock-projection is ported here, match production's real behavior by
-# dropping anything older than a 6h ghost window instead of showing
-# every vessel this system has ever heard from.
+# --- Geo helpers, ported verbatim from Reed's live-positions.py/next-vessel.py ---
+
+def _hav_mi(lat1, lon1, lat2, lon2):
+    r_mi = 3958.7613
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    d = (math.sin(math.radians(lat2 - lat1) / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2)
+    return 2 * r_mi * math.asin(math.sqrt(d))
+
+
+def _hav_km(a_lat, a_lon, b_lat, b_lon):
+    r = 6371.0
+    p1, p2 = math.radians(a_lat), math.radians(b_lat)
+    x = math.sin(math.radians(b_lat - a_lat) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(b_lon - a_lon) / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(x))
+
+
+def _bearing_deg(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    x = math.sin(dlon) * math.cos(p2)
+    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlon)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+def _dir_from_cog(cog):
+    """Half-circle split, not +-45deg buckets -- see live-positions.py's
+    _dir_from_cog for the real bug (Neil N. Diehl) this fixed upstream."""
+    if cog is None or not isinstance(cog, (int, float)):
+        return None
+    c = cog % 360
+    if c > 270 or c < 90:
+        return "upbound"
+    if 90 <= c <= 270:
+        return "downbound"
+    return None
+
+
+def _lat_lon_to_rm(lat, lon):
+    """4-anchor nearest-two-point interpolation -- the SIMPLE river-mile
+    system next-vessel.py uses for real (live-tier) positions. NOT the
+    channel-geojson-snapped system used for dead-reckoned/lock-projected
+    tiers (that one needs the channel polyline data, not ported yet)."""
+    scored = sorted(CENTERLINE, key=lambda c: _hav_km(lat, lon, c[0], c[1]))
+    a, b = scored[0], scored[1]
+    da, db = _hav_km(lat, lon, a[0], a[1]), _hav_km(lat, lon, b[0], b[1])
+    total = da + db
+    if total == 0:
+        return a[2]
+    return (a[2] * db + b[2] * da) / total
+
+
+def _clean_name(n):
+    n = (n or "").strip()
+    parts = n.rsplit(" ", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        n = parts[0]
+    return n.title()
 
 
 @app.get("/live-positions")
 async def live_positions():
+    """Field-parity pass 2026-08-02: real/live-tier vessels now carry the
+    full enrichment set the old next-vessel-server returns (speed_mph,
+    cog_deg, heading_deg, shiptype, is_commercial, distance/bearing_from_
+    receiver, river_mile, direction, callsign, destination, draught_m).
+
+    HONEST GAP still open, not silently faked: the dead-reckoned tier
+    (is_live=false, projected forward from a stale-but-recent real fix)
+    and the lock-projected tier (is_lock_projected=true, no AIS ever
+    heard but LPMS shows a departure heading our way -- position_basis/
+    leg_median_min/barge_class/frac_complete/confidence/last_lock) are
+    NOT ported yet. That's the single biggest remaining piece -- see
+    Reed's handoff notes on the bus for the exact source logic
+    (_project_rm_with_lockage, KNOWN_STOP_RATE, the empirical transit
+    model, the reception-radius/next-lock-ETA capping rules). Only
+    genuinely-live vessels (heard within FRESH_CUTOFF_S) show up here
+    until that lands -- no ghost/estimated markers yet.
+    """
     now = datetime.now(timezone.utc)
     async with app.state.pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT mmsi, name, last_seen, last_lat, last_lon, last_source_id, quality
+            SELECT mmsi, name, last_seen, last_lat, last_lon, last_source_id, quality,
+                   sog_mph, cog_deg, heading_deg, nav_status, shiptype, is_commercial,
+                   callsign, destination, draught
             FROM vessel_current_state
-            WHERE last_seen > now() - make_interval(secs => $1)
             ORDER BY last_seen DESC
-            """,
-            GHOST_WINDOW_S,
+            """
         )
 
     vessels = []
     for r in rows:
         age_s = (now - r["last_seen"]).total_seconds()
+        is_live = age_s < FRESH_CUTOFF_S
+        if not is_live:
+            # Dead-reckoned/lock-projected tiers not ported yet (see
+            # docstring) -- rather than show a stale dot in the wrong
+            # place, only genuinely-live vessels appear for now.
+            continue
+
+        lat, lon = r["last_lat"], r["last_lon"]
+        src = RECEIVERS.get(r["last_source_id"], RECEIVERS["lake_mac"])
+        direction = _dir_from_cog(r["cog_deg"])
+        river_mile = _lat_lon_to_rm(lat, lon) if lat is not None and lon is not None else None
+
         vessels.append({
             "mmsi": r["mmsi"],
-            "name": r["name"],
-            "lat": r["last_lat"],
-            "lon": r["last_lon"],
+            "name": _clean_name(r["name"]),
+            "lat": round(lat, 6) if lat is not None else None,
+            "lon": round(lon, 6) if lon is not None else None,
+            "speed_mph": r["sog_mph"],
+            "cog_deg": round(r["cog_deg"], 1) if r["cog_deg"] is not None else None,
+            "heading_deg": r["heading_deg"],
+            "shiptype": r["shiptype"],
+            "is_commercial": r["is_commercial"],
             "last_signal_s": age_s,
-            "is_live": age_s < FRESH_CUTOFF_S,
-            # TODO (not yet ported from next-vessel-server): speed_mph,
-            # cog_deg, heading_deg, shiptype, is_commercial, distance/
-            # bearing_from_receiver, river_mile, direction, callsign,
-            # destination, draught_m, last_lock/path_from_lock projection.
+            "is_live": is_live,
+            "heard_by": r["last_source_id"],
+            "distance_mi_from_receiver": round(_hav_mi(src["lat"], src["lon"], lat, lon), 2) if lat is not None else None,
+            "bearing_deg_from_receiver": round(_bearing_deg(src["lat"], src["lon"], lat, lon), 0) if lat is not None else None,
+            "river_mile": round(river_mile, 2) if river_mile is not None else None,
+            "direction": direction,
+            "callsign": r["callsign"] or None,
+            "destination": r["destination"] or None,
+            "draught_m": r["draught"],
         })
 
     return {
@@ -134,34 +277,224 @@ async def live_positions():
     }
 
 
+# --- Lock-status 4-tier flag logic, ported verbatim from lock-status.py ---
+# (thresholds/wording unchanged -- this is presentation logic Tom actually
+# sees, so it's a direct port, not a rebuild-from-guesses.)
+
+def _dir_word(raw):
+    return {"U": "upbound", "D": "downbound"}.get(raw)
+
+
+def _delay_range_for_barges(barges):
+    if barges is None or barges == 0:
+        return ("15-30 min", 22)
+    if barges <= 3:
+        return ("30-45 min", 37)
+    if barges <= 8:
+        return ("45-60 min", 57)
+    if barges <= 12:
+        return ("60-90 min", 75)
+    if barges <= 15:
+        return ("90-120 min", 105)
+    return ("2+ hours", 135)
+
+
+def _is_recreational(vessel_name, raw_payload):
+    if "RECREATION" in (vessel_name or "").upper():
+        return True
+    try:
+        payload = json.loads(raw_payload) if isinstance(raw_payload, str) else (raw_payload or {})
+    except (TypeError, ValueError):
+        payload = {}
+    return payload.get("vessel_no") == "9999999"
+
+
+def _find_current_lockage(rows, now):
+    """Vessel with sol_at <= now and (no eol_at OR end within last 30 min)
+    -- the one currently in the chamber."""
+    best = None
+    for r in rows:
+        if _is_recreational(r["vessel_name"], r["raw_payload"]):
+            continue
+        sol, end = r["sol_at"], r["eol_at"]
+        if sol is None:
+            continue
+        in_progress = sol <= now if end is None else (sol <= now <= end + timedelta(minutes=15))
+        if in_progress:
+            candidate = {
+                "vessel": _clean_name(r["vessel_name"]),
+                "barges": r["barges"] or 0,
+                "direction": r["direction"],
+                "started_at": sol,
+                "started_min_ago": int((now - sol).total_seconds() / 60),
+            }
+            if best is None or candidate["started_at"] > best["started_at"]:
+                best = candidate
+    return best
+
+
+def _find_last_cleared(rows, now):
+    """Most recent commercial lockage that has already ended."""
+    best = None
+    for r in rows:
+        if _is_recreational(r["vessel_name"], r["raw_payload"]):
+            continue
+        end = r["eol_at"]
+        if not end or end > now:
+            continue
+        if best is None or end > best["end"]:
+            best = {
+                "vessel": _clean_name(r["vessel_name"]),
+                "barges": r["barges"] or 0,
+                "direction": r["direction"],
+                "end": end,
+                "min_ago": int((now - end).total_seconds() / 60),
+            }
+    return best
+
+
+def _compute_flag(live_state, active, last_cleared, now):
+    """4-tier logic, exact thresholds from lock-status.py:
+    normal  — pending=0 AND (locking=0 OR active has 0-3 barges)
+    watch   — pending=1 OR active 4-8 barges OR delay24h_min >= 20
+    delay   — (pending>=1 AND locking=1) OR (4-8 barges AND delay24h_min >= 30)
+              OR pending>=2 with any active work
+    jam     — active has 9+ barges (double-cut) OR active lockage 90+ min old
+              OR pending>=3
+    """
+    pending = live_state.get("pending", 0) or 0
+    locking = live_state.get("locking", 0) or 0
+    delay24h = live_state.get("delay24h_min", 0) or 0
+    active_barges = (active or {}).get("barges") or 0
+    active_age = (active or {}).get("started_min_ago") or 0
+
+    if active_barges >= 9:
+        return "jam", active_barges, "big-tow-double-cut"
+    if active and active_age >= 90:
+        return "jam", None, "long-lockage"
+    if pending >= 3:
+        return "jam", None, "queue-backup"
+    if pending >= 1 and locking >= 1:
+        return "delay", active_barges, "queue-and-active"
+    if active_barges >= 4 and delay24h >= 30:
+        return "delay", active_barges, "medium-tow-with-recent-delays"
+    if pending >= 2:
+        return "delay", None, "queue-pending"
+    if pending >= 1:
+        return "watch", None, "one-pending"
+    if active_barges >= 4:
+        return "watch", active_barges, "medium-tow"
+    if delay24h >= 20:
+        return "watch", None, "recent-delays"
+    return "normal", active_barges, "clear"
+
+
+def _build_badge_and_line(name, live_state, flag, active_barges, driver, active, last_cleared):
+    pending = live_state.get("pending", 0) or 0
+    delay24h = live_state.get("delay24h_min", 0) or 0
+
+    if flag == "jam":
+        if driver == "big-tow-double-cut":
+            range_copy, _ = _delay_range_for_barges(active_barges)
+            badge = f"~{range_copy} delay"
+            v = active["vessel"]
+            dir_word = _dir_word(active["direction"]) or ""
+            line = (f"{name} — big tow ({v}, {active_barges}-barge double-cut) locking through "
+                    f"{dir_word}. Expect ~{range_copy} delay.")
+        elif driver == "long-lockage":
+            badge = "Extended lockage"
+            v = (active or {}).get("vessel", "tow")
+            line = f"{name} — {v} has been locking {active['started_min_ago']}+ min. Expect ongoing delay."
+        else:  # queue-backup
+            badge = f"{pending} tows pending"
+            line = f"{name} — jam: {pending} tows pending, plan for 2+ hr wait."
+    elif flag == "delay":
+        badge = "~1 hr delay"
+        if active_barges:
+            range_copy, _ = _delay_range_for_barges(active_barges)
+            line = f"{name} — congested. {active_barges}-barge tow locking, expect ~{range_copy} delay."
+        else:
+            line = f"{name} — congested with {pending} pending. Expect ~1 hr wait."
+    elif flag == "watch":
+        badge = "Medium tow — plan ~45 min"
+        if active_barges:
+            line = f"{name} — medium tow ({active_barges} barges) locking. Plan for ~45 min."
+        elif pending:
+            line = f"{name} — 1 tow pending, watch for delay."
+        else:
+            line = f"{name} — recent 24h delays averaging {delay24h} min. Plan for potential wait."
+    else:  # normal
+        badge = "Clear"
+        if last_cleared:
+            v = last_cleared["vessel"]
+            line = f"{name} — clear. Last tow cleared {last_cleared['min_ago']} min ago ({v}, {last_cleared['barges']} barges)."
+        else:
+            line = f"{name} — clear. No recent commercial activity."
+
+    return badge, line
+
+
 @app.get("/lock-status")
 async def lock_status():
+    """Field-parity pass 2026-08-02: 4-tier flag/badge/conditions_line
+    logic ported verbatim from Reed's lock-status.py (see functions
+    above). Reads per-transit rows from lock_status_observation (the
+    queue-row equivalent) plus the live pending/locking/delay/throughput
+    snapshot from lock_live_state -- both now sent by Reed's collector
+    (added 2026-08-02 specifically for this port)."""
     now = datetime.now(timezone.utc)
     async with app.state.pool.acquire() as conn:
-        rows = await conn.fetch(
+        obs_rows = await conn.fetch(
             """
-            SELECT DISTINCT ON (lock_id) lock_id, vessel_name, barges, direction, time
+            SELECT lock_id, vessel_name, barges, direction, sol_at, eol_at, raw_payload
             FROM lock_status_observation
+            WHERE time > now() - interval '30 days'
             ORDER BY lock_id, time DESC
             """
         )
-    last_cleared_by_lock = {r["lock_id"]: r for r in rows}
+        live_rows = await conn.fetch(
+            "SELECT lock_id, pending, locking, delay24h_min, throughput_24h FROM lock_live_state"
+        )
+
+    rows_by_lock: dict[str, list] = {}
+    for r in obs_rows:
+        rows_by_lock.setdefault(r["lock_id"], []).append(r)
+    live_by_lock = {r["lock_id"]: r for r in live_rows}
 
     locks = {}
     for lock_id, meta in LOCK_META.items():
-        last = last_cleared_by_lock.get(lock_id)
+        rows = rows_by_lock.get(lock_id, [])
+        live = live_by_lock.get(lock_id)
+        live_state = {
+            "pending": live["pending"] if live else 0,
+            "locking": live["locking"] if live else 0,
+            "delay24h_min": live["delay24h_min"] if live else 0,
+            "throughput_24h": live["throughput_24h"] if live else 0,
+        }
+        active = _find_current_lockage(rows, now)
+        last_cleared = _find_last_cleared(rows, now)
+        flag, active_barges, driver = _compute_flag(live_state, active, last_cleared, now)
+        badge, line = _build_badge_and_line(meta["name"], live_state, flag, active_barges, driver, active, last_cleared)
+
         locks[lock_id] = {
             "name": meta["name"],
             "river_mile": meta["river_mile"],
-            "last_cleared": {
-                "vessel": last["vessel_name"],
-                "barges": last["barges"],
-                "min_ago": round((now - last["time"]).total_seconds() / 60),
-                "direction": last["direction"],
-            } if last else None,
-            # TODO: flag/map_badge/conditions_line/live_state/active_lockage
-            # -- these are derived presentation logic in the current API,
-            # not raw stored fields. Port before cutover.
+            "flag": flag,
+            "map_badge": badge,
+            "conditions_line": line,
+            "live_state": live_state,
+            "active_lockage": ({
+                "vessel": active["vessel"],
+                "barges": active["barges"],
+                "direction": active["direction"],
+                "started_min_ago": active["started_min_ago"],
+            } if active else None),
+            "last_cleared": ({
+                "vessel": last_cleared["vessel"],
+                "barges": last_cleared["barges"],
+                "min_ago": last_cleared["min_ago"],
+                "direction": _dir_word(last_cleared["direction"]),
+            } if last_cleared else None),
         }
 
     return {"generated_at": now.isoformat(), "locks": locks}
@@ -231,16 +564,25 @@ async def write_event(conn: asyncpg.Connection, source_id: str, event: Telemetry
             await conn.execute(
                 """
                 INSERT INTO vessel_current_state (mmsi, name, last_seen, last_lat, last_lon,
-                                                    last_source_id, quality)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                                    last_source_id, quality, sog_mph, cog_deg,
+                                                    heading_deg, nav_status, shiptype,
+                                                    is_commercial, callsign, destination, draught)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                 ON CONFLICT (mmsi) DO UPDATE SET
                     name = EXCLUDED.name, last_seen = EXCLUDED.last_seen,
                     last_lat = EXCLUDED.last_lat, last_lon = EXCLUDED.last_lon,
-                    last_source_id = EXCLUDED.last_source_id, quality = EXCLUDED.quality
+                    last_source_id = EXCLUDED.last_source_id, quality = EXCLUDED.quality,
+                    sog_mph = EXCLUDED.sog_mph, cog_deg = EXCLUDED.cog_deg,
+                    heading_deg = EXCLUDED.heading_deg, nav_status = EXCLUDED.nav_status,
+                    shiptype = EXCLUDED.shiptype, is_commercial = EXCLUDED.is_commercial,
+                    callsign = EXCLUDED.callsign, destination = EXCLUDED.destination,
+                    draught = EXCLUDED.draught
                 WHERE EXCLUDED.last_seen > vessel_current_state.last_seen
                 """,
                 p["mmsi"], p.get("name"), observed_at, p["lat"], p["lon"],
-                source_id, p.get("quality", "live"),
+                source_id, p.get("quality", "live"), p.get("sog_mph"), p.get("cog_deg"),
+                p.get("heading_deg"), p.get("nav_status"), p.get("shiptype"),
+                p.get("is_commercial"), p.get("callsign"), p.get("destination"), p.get("draught"),
             )
 
     elif event.event_type == "lock_status":
@@ -254,6 +596,23 @@ async def write_event(conn: asyncpg.Connection, source_id: str, event: Telemetry
             observed_at, source_id, p["lock_id"], p.get("vessel_name"),
             p.get("direction"), p.get("barges"), _parse_dt(p.get("sol_at")),
             _parse_dt(p.get("eol_at")), json.dumps(p),
+        )
+
+    elif event.event_type == "lock_live_state":
+        p = event.payload
+        await conn.execute(
+            """
+            INSERT INTO lock_live_state (lock_id, pending, locking, delay24h_min,
+                                          throughput_24h, last_seen)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (lock_id) DO UPDATE SET
+                pending = EXCLUDED.pending, locking = EXCLUDED.locking,
+                delay24h_min = EXCLUDED.delay24h_min, throughput_24h = EXCLUDED.throughput_24h,
+                last_seen = EXCLUDED.last_seen
+            WHERE EXCLUDED.last_seen >= lock_live_state.last_seen
+            """,
+            p["lock_id"], p.get("pending", 0), p.get("locking", 0),
+            p.get("delay24h_min", 0), p.get("throughput_24h", 0), observed_at,
         )
 
 
@@ -335,9 +694,10 @@ async def submit_photo(sub: PhotoSubmission):
 
 # --- Email signup ---------------------------------------------------------
 # This route existed on the OLD worker deployed at this same name before the
-# Track C rebuild -- deploying the new container-based worker over it silently
-# dropped it (the site's landing-page signup form kept calling it and got
-# 404s). Restoring it here, backed by its own table.
+# Track C rebuild -- deploying a container-based worker over it silently
+# dropped it once already (2026-08-01), causing real 404s on the site's
+# landing-page signup form for ~2 days before it was caught. Keep this
+# section intact on every future merge/port.
 class SignupRequest(BaseModel):
     email: EmailStr
     site: str | None = None
