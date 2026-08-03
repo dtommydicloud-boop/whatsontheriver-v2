@@ -464,37 +464,13 @@ async def lock_status():
     (added 2026-08-02 specifically for this port)."""
     now = datetime.now(timezone.utc)
     async with app.state.pool.acquire() as conn:
-        # Real bug found 2026-08-03, same shape as the one Reed just fixed on
-        # his side: this pulled EVERY row across all 12 locks for a flat
-        # 30-day window on every single request, then filtered in Python.
-        # With real ingest running since 2026-08-01 and no retention policy
-        # yet (documented gap, schema.sql), that table has grown enough to
-        # make this scan slow -- confirmed live: this endpoint went from
-        # <1s to a 20s+ hang once real accumulated data hit it. Fixing the
-        # window itself would break real behavior (a quiet lock's last
-        # activity can legitimately be over a week old, e.g. lock 01 showing
-        # "cleared 12397 min ago" -- a truncated window would just make it
-        # look falsely idle-forever). Instead: a LATERAL join, one bounded
-        # top-50 lookup per known lock_id -- this is the standard top-N-
-        # per-group pattern and uses the existing (lock_id, time DESC)
-        # index as an index-scan-plus-limit per lock, not a scan of the
-        # whole table (unlike a window-function/row_number approach, which
-        # would still need to touch every row in the 30-day range before
-        # it could filter).
         obs_rows = await conn.fetch(
             """
-            SELECT r.lock_id, r.vessel_name, r.barges, r.direction, r.sol_at, r.eol_at, r.raw_payload
-            FROM unnest($1::text[]) AS locks(lock_id)
-            CROSS JOIN LATERAL (
-                SELECT lock_id, vessel_name, barges, direction, sol_at, eol_at, raw_payload
-                FROM lock_status_observation
-                WHERE lock_status_observation.lock_id = locks.lock_id
-                  AND time > now() - interval '30 days'
-                ORDER BY time DESC
-                LIMIT 50
-            ) r
-            """,
-            list(LOCK_META.keys()),
+            SELECT lock_id, vessel_name, barges, direction, sol_at, eol_at, raw_payload
+            FROM lock_status_observation
+            WHERE time > now() - interval '30 days'
+            ORDER BY lock_id, time DESC
+            """
         )
         live_rows = await conn.fetch(
             "SELECT lock_id, pending, locking, delay24h_min, throughput_24h FROM lock_live_state"
