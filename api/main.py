@@ -101,7 +101,27 @@ SOURCE_SECRETS: dict[str, str] = {
 
 @app.on_event("startup")
 async def startup():
-    app.state.pool = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=2, max_size=10)
+    # Real bug found 2026-08-03: this container runs for hours between
+    # restarts (that's the point of sleepAfter), but Neon's serverless
+    # Postgres suspends its compute after a few minutes of no activity
+    # ("scale to zero"). asyncpg does NOT ping-check a pooled connection
+    # before handing it to a query (unlike some other Postgres clients) --
+    # so after any real gap in traffic, the next request(s) get a
+    # connection that looks fine but is actually dead, and the query hangs
+    # on it for a long time (client sees 15-20s timeouts, HTTP 000) instead
+    # of failing fast. Two real fixes, not a workaround: (1)
+    # max_inactive_connection_lifetime proactively recycles idle
+    # connections well before they'd go stale from a Neon suspend: (2)
+    # command_timeout means even a genuinely stuck query fails fast and
+    # frees its pool slot instead of holding it (and eventually the whole
+    # pool) hostage forever.
+    app.state.pool = await asyncpg.create_pool(
+        os.environ["DATABASE_URL"],
+        min_size=2,
+        max_size=10,
+        max_inactive_connection_lifetime=60,
+        command_timeout=10,
+    )
     async with app.state.pool.acquire() as conn:
         await conn.execute(
             """
