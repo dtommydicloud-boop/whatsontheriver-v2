@@ -720,3 +720,20 @@ async def signup(req: SignupRequest):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+# --- Temporary operational escape hatch -----------------------------------
+# Cloudflare Containers' sleepAfter idle-restart never fires while ANY
+# traffic keeps hitting the container -- including a collector's retry loop
+# hammering a route that 401s, which is exactly what happened rolling out
+# SOURCE_SECRET_lpms 2026-08-03: the old process kept getting kept alive by
+# the very retries that needed the new envVars it didn't have. No
+# `wrangler containers restart` exists (only the destructive `delete`), so
+# this lets the running process force its own supervised restart -- picks
+# up fresh envVars from the DO constructor without touching the app
+# definition. Gated on ADMIN_RESTART_KEY so it's not a public kill switch.
+@app.post("/admin/restart")
+async def admin_restart(x_admin_key: str = Header(default="")):
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    os._exit(1)
