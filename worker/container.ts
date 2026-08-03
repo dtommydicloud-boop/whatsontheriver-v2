@@ -16,6 +16,7 @@ interface Env {
   DATABASE_URL: string;
   SOURCE_SECRET_lake_mac: string;
   SOURCE_SECRET_red_wing: string;
+  SOURCE_SECRET_lpms: string;
 }
 
 export class WhatsOnTheRiverAPI extends Container<Env> {
@@ -28,6 +29,7 @@ export class WhatsOnTheRiverAPI extends Container<Env> {
       DATABASE_URL: env.DATABASE_URL,
       SOURCE_SECRET_lake_mac: env.SOURCE_SECRET_lake_mac,
       SOURCE_SECRET_red_wing: env.SOURCE_SECRET_red_wing,
+      SOURCE_SECRET_lpms: env.SOURCE_SECRET_lpms,
     };
   }
 }
