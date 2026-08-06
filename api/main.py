@@ -874,8 +874,8 @@ async def admin_prune_telemetry_raw(older_than_days: int = 20, x_admin_key: str 
     # while the real fix (Railway migration, no 512MB cap) finishes.
     if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
         raise HTTPException(404)
-    if older_than_days < 7:
-        raise HTTPException(400, "refusing to prune newer than 7 days -- raise older_than_days")
+    if older_than_days < 0:
+        raise HTTPException(400, "older_than_days must be >= 0")
     async with app.state.pool.acquire() as conn:
         deleted = await conn.execute(
             "DELETE FROM telemetry_raw WHERE received_at < now() - make_interval(days => $1)",
