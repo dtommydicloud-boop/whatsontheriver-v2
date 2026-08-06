@@ -891,6 +891,53 @@ async def admin_prune_telemetry_raw(older_than_days: int = 20, x_admin_key: str 
     return {"deleted": deleted, "remaining_telemetry_raw_rows": remaining, "vacuumed": True}
 
 
+@app.get("/admin/live-schema")
+async def admin_live_schema(x_admin_key: str = Header(default="")):
+    # Railway-migration helper: schema.sql is known stale (photo_submissions
+    # was never added to it, created ad hoc directly on Neon) so pull the
+    # real live schema straight from information_schema instead of
+    # reconstructing it by hand from scattered SQL files.
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    async with app.state.pool.acquire() as conn:
+        cols = await conn.fetch(
+            """
+            SELECT table_name, column_name, data_type, udt_name, is_nullable,
+                   column_default, character_maximum_length, numeric_precision
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+            ORDER BY table_name, ordinal_position
+            """
+        )
+        pks = await conn.fetch(
+            """
+            SELECT tc.table_name, kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+            WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public'
+            """
+        )
+        uniques = await conn.fetch(
+            """
+            SELECT tc.table_name, kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+            WHERE tc.constraint_type = 'UNIQUE' AND tc.table_schema = 'public'
+            """
+        )
+        indexes = await conn.fetch(
+            "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public'"
+        )
+    return {
+        "columns": [_json_safe(r) for r in cols],
+        "primary_keys": [_json_safe(r) for r in pks],
+        "unique_constraints": [_json_safe(r) for r in uniques],
+        "indexes": [_json_safe(r) for r in indexes],
+    }
+
+
 @app.get("/admin/table-counts")
 async def admin_table_counts(x_admin_key: str = Header(default="")):
     if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
