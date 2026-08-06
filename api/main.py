@@ -464,18 +464,25 @@ async def lock_status():
     snapshot from lock_live_state -- both now sent by Reed's collector
     (added 2026-08-02 specifically for this port)."""
     now = datetime.now(timezone.utc)
-    async with app.state.pool.acquire() as conn:
-        obs_rows = await conn.fetch(
-            """
-            SELECT lock_id, vessel_name, barges, direction, sol_at, eol_at, raw_payload
-            FROM lock_status_observation
-            WHERE time > now() - interval '30 days'
-            ORDER BY lock_id, time DESC
-            """
-        )
-        live_rows = await conn.fetch(
-            "SELECT lock_id, pending, locking, delay24h_min, throughput_24h FROM lock_live_state"
-        )
+    try:
+        async with app.state.pool.acquire() as conn:
+            obs_rows = await conn.fetch(
+                """
+                SELECT lock_id, vessel_name, barges, direction, sol_at, eol_at, raw_payload
+                FROM lock_status_observation
+                WHERE time > now() - interval '30 days'
+                ORDER BY lock_id, time DESC
+                """
+            )
+            live_rows = await conn.fetch(
+                "SELECT lock_id, pending, locking, delay24h_min, throughput_24h FROM lock_live_state"
+            )
+    except Exception as e:
+        # TEMP 2026-08-06: /lock-status started 500ing/hanging on live prod
+        # mid-migration-work -- same stash-and-read pattern as /ingest's
+        # debug endpoint, remove once root cause is found and fixed.
+        app.state.last_lock_status_error = f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}"
+        raise HTTPException(500, "lock-status failed")
 
     rows_by_lock: dict[str, list] = {}
     for r in obs_rows:
@@ -769,6 +776,13 @@ async def admin_last_ingest_error(x_admin_key: str = Header(default="")):
     if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
         raise HTTPException(404)
     return {"last_ingest_error": getattr(app.state, "last_ingest_error", None)}
+
+
+@app.get("/admin/last-lock-status-error")
+async def admin_last_lock_status_error(x_admin_key: str = Header(default="")):
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    return {"last_lock_status_error": getattr(app.state, "last_lock_status_error", None)}
 
 
 @app.post("/admin/restart")
