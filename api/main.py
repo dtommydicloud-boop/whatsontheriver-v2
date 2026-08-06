@@ -864,6 +864,28 @@ async def admin_export_table(
             raise HTTPException(500, repr(e))
 
 
+@app.post("/admin/prune-telemetry-raw")
+async def admin_prune_telemetry_raw(older_than_days: int = 20, x_admin_key: str = Header(default="")):
+    # TEMP EMERGENCY 2026-08-06: Neon project hit its 512MB cap on 2026-08-03,
+    # which has been silently failing every /ingest write since. telemetry_raw
+    # is the raw forensic archive -- not read by the live map or lock-status
+    # logic (those read vessel_position / lock_status_observation directly) --
+    # so it's the safe thing to prune to get writes flowing again right now,
+    # while the real fix (Railway migration, no 512MB cap) finishes.
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    if older_than_days < 7:
+        raise HTTPException(400, "refusing to prune newer than 7 days -- raise older_than_days")
+    async with app.state.pool.acquire() as conn:
+        deleted = await conn.execute(
+            "DELETE FROM telemetry_raw WHERE received_at < now() - make_interval(days => $1)",
+            older_than_days,
+            timeout=100,
+        )
+        remaining = await conn.fetchval("SELECT count(*) FROM telemetry_raw")
+    return {"deleted": deleted, "remaining_telemetry_raw_rows": remaining}
+
+
 @app.get("/admin/table-counts")
 async def admin_table_counts(x_admin_key: str = Header(default="")):
     if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
