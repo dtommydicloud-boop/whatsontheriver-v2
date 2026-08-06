@@ -860,3 +860,17 @@ async def admin_table_counts(x_admin_key: str = Header(default="")):
             except Exception as e:
                 out[t] = f"error: {e}"
     return out
+
+
+@app.get("/admin/export-table-range")
+async def admin_export_table_range(table: str, x_admin_key: str = Header(default="")):
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    if table not in _EXPORT_HYPERTABLES:
+        raise HTTPException(400, f"table must be one of {list(_EXPORT_HYPERTABLES)}")
+    time_col = _EXPORT_HYPERTABLES[table]
+    async with app.state.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"SELECT min({time_col}) AS oldest, max({time_col}) AS newest, now() AS db_now FROM {table}"
+        )
+        return _json_safe(row)
