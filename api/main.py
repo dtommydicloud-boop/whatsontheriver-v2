@@ -757,3 +757,77 @@ async def admin_restart(x_admin_key: str = Header(default="")):
     if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
         raise HTTPException(404)
     os._exit(1)
+
+
+# --- Temporary migration escape hatch --------------------------------------
+# 2026-08-06: migrating this DB to Railway, but the raw Neon connection
+# string was never saved locally (deliberately, for security) -- only this
+# running app has it, via DATABASE_URL. Rather than go hunting for Neon
+# console credentials, export through the app's own DB pool, gated the same
+# way as /admin/restart. Small operational tables export in full; the large
+# hypertables (telemetry_raw/vessel_position/lock_status_observation/
+# derived_eta) are bounded to a recent window via ?days= so this stays a
+# reasonable HTTP payload instead of trying to ship the entire forensic
+# archive over JSON. Remove this route once the migration is done -- it's
+# a real, if gated, data-export surface and shouldn't linger.
+import decimal
+
+
+def _json_safe(row):
+    out = {}
+    for k, v in dict(row).items():
+        if isinstance(v, (datetime, decimal.Decimal)):
+            out[k] = str(v)
+        else:
+            out[k] = v
+    return out
+
+
+@app.get("/admin/export")
+async def admin_export(days: int = 45, x_admin_key: str = Header(default="")):
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+
+    out = {}
+    async with app.state.pool.acquire() as conn:
+        for table in ("sources", "vessel_current_state", "lock_live_state",
+                      "email_signups", "photo_submissions"):
+            try:
+                rows = await conn.fetch(f"SELECT * FROM {table}")
+                out[table] = [_json_safe(r) for r in rows]
+            except Exception as e:
+                out[table] = {"error": str(e)}
+
+        for table, time_col in (
+            ("telemetry_raw", "received_at"),
+            ("vessel_position", "time"),
+            ("lock_status_observation", "time"),
+            ("derived_eta", "computed_at"),
+        ):
+            try:
+                rows = await conn.fetch(
+                    f"SELECT * FROM {table} WHERE {time_col} > now() - make_interval(days => $1) ORDER BY {time_col}",
+                    days,
+                )
+                out[table] = [_json_safe(r) for r in rows]
+            except Exception as e:
+                out[table] = {"error": str(e)}
+
+    return out
+
+
+@app.get("/admin/table-counts")
+async def admin_table_counts(x_admin_key: str = Header(default="")):
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    tables = ["sources", "telemetry_raw", "vessel_position", "lock_status_observation",
+              "vessel_current_state", "derived_eta", "email_signups", "photo_submissions",
+              "lock_live_state"]
+    out = {}
+    async with app.state.pool.acquire() as conn:
+        for t in tables:
+            try:
+                out[t] = await conn.fetchval(f"SELECT count(*) FROM {t}")
+            except Exception as e:
+                out[t] = f"error: {e}"
+    return out
