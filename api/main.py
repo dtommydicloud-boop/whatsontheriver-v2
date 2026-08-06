@@ -466,16 +466,25 @@ async def lock_status():
     now = datetime.now(timezone.utc)
     try:
         async with app.state.pool.acquire() as conn:
+            # Real timeout found live 2026-08-06: this table is ~509K rows
+            # now and the (lock_id, time DESC) ORDER BY doesn't line up with
+            # either index cleanly (one covers the WHERE, the other the
+            # ORDER BY), so the sort + Neon's occasional scale-to-zero wake
+            # latency together were blowing past the pool's 10s
+            # command_timeout. Same per-query override already used for
+            # /admin/export -- doesn't touch the pool-wide default.
             obs_rows = await conn.fetch(
                 """
                 SELECT lock_id, vessel_name, barges, direction, sol_at, eol_at, raw_payload
                 FROM lock_status_observation
                 WHERE time > now() - interval '30 days'
                 ORDER BY lock_id, time DESC
-                """
+                """,
+                timeout=30,
             )
             live_rows = await conn.fetch(
-                "SELECT lock_id, pending, locking, delay24h_min, throughput_24h FROM lock_live_state"
+                "SELECT lock_id, pending, locking, delay24h_min, throughput_24h FROM lock_live_state",
+                timeout=15,
             )
     except Exception as e:
         # TEMP 2026-08-06: /lock-status started 500ing/hanging on live prod
