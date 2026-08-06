@@ -883,7 +883,12 @@ async def admin_prune_telemetry_raw(older_than_days: int = 20, x_admin_key: str 
             timeout=100,
         )
         remaining = await conn.fetchval("SELECT count(*) FROM telemetry_raw")
-    return {"deleted": deleted, "remaining_telemetry_raw_rows": remaining}
+        # Plain DELETE only marks tuples dead -- doesn't shrink the file or
+        # free space against Neon's project-size cap. VACUUM FULL rewrites
+        # the table to actually reclaim it. Can't run inside conn.transaction()
+        # (VACUUM disallowed in a tx block); this execute is unwrapped so it's fine.
+        await conn.execute("VACUUM FULL telemetry_raw", timeout=100)
+    return {"deleted": deleted, "remaining_telemetry_raw_rows": remaining, "vacuumed": True}
 
 
 @app.get("/admin/table-counts")
