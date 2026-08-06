@@ -798,30 +798,51 @@ async def admin_export(days: int = 45, x_admin_key: str = Header(default="")):
             except Exception as e:
                 out[table] = {"error": str(e)}
 
-        for table, time_col in (
-            ("telemetry_raw", "received_at"),
-            ("vessel_position", "time"),
-            ("lock_status_observation", "time"),
-            ("derived_eta", "computed_at"),
-        ):
-            try:
-                # Real bug hit exporting this for the Railway migration: the
-                # pool's command_timeout=10 (set 2026-08-03 to stop hung
-                # queries from holding connections hostage) also silently
-                # killed this legitimate large export, with an empty
-                # exception string that made it look like nothing was even
-                # wrong. Override per-query with a longer timeout instead of
-                # touching the pool default that's protecting everything else.
-                rows = await conn.fetch(
-                    f"SELECT * FROM {table} WHERE {time_col} > now() - make_interval(days => $1) ORDER BY {time_col}",
-                    days,
-                    timeout=120,
-                )
-                out[table] = [_json_safe(r) for r in rows]
-            except Exception as e:
-                out[table] = {"error": repr(e)}
-
     return out
+
+
+_EXPORT_HYPERTABLES = {
+    "telemetry_raw": "received_at",
+    "vessel_position": "time",
+    "lock_status_observation": "time",
+    "derived_eta": "computed_at",
+}
+
+
+@app.get("/admin/export-table")
+async def admin_export_table(
+    table: str,
+    since_days_ago: float = 1,
+    until_days_ago: float = 0,
+    x_admin_key: str = Header(default=""),
+):
+    # Whole-archive-in-one-response (the old /admin/export hypertable loop)
+    # blew past both the container's response-size/time budget on the real
+    # 45-day pull -- HTTP 500 with a tiny body, no useful error surfaced.
+    # This exports ONE table over a bounded day-window per call so a driver
+    # script can walk the full range in safe slices instead.
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    if table not in _EXPORT_HYPERTABLES:
+        raise HTTPException(400, f"table must be one of {list(_EXPORT_HYPERTABLES)}")
+    if since_days_ago <= until_days_ago:
+        raise HTTPException(400, "since_days_ago must be > until_days_ago")
+
+    time_col = _EXPORT_HYPERTABLES[table]
+    async with app.state.pool.acquire() as conn:
+        try:
+            rows = await conn.fetch(
+                f"SELECT * FROM {table} "
+                f"WHERE {time_col} > now() - make_interval(days => $1) "
+                f"AND {time_col} <= now() - make_interval(days => $2) "
+                f"ORDER BY {time_col}",
+                since_days_ago,
+                until_days_ago,
+                timeout=100,
+            )
+            return {"table": table, "rows": [_json_safe(r) for r in rows]}
+        except Exception as e:
+            raise HTTPException(500, repr(e))
 
 
 @app.get("/admin/table-counts")
