@@ -29,6 +29,7 @@ import json
 import math
 import os
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
@@ -650,14 +651,22 @@ async def ingest(request: Request, x_signature: str = Header(...)):
     # foreign-key against it -- upsert is deliberate, not a bug: a new
     # receiver location should Just Work the first time it POSTs, not
     # need a manual DB row first.
-    async with app.state.pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO sources (source_id, type) VALUES ($1, 'unknown') ON CONFLICT DO NOTHING",
-            batch.source_id,
-        )
-        async with conn.transaction():
-            for event in batch.events:
-                await write_event(conn, batch.source_id, event)
+    try:
+        async with app.state.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO sources (source_id, type) VALUES ($1, 'unknown') ON CONFLICT DO NOTHING",
+                batch.source_id,
+            )
+            async with conn.transaction():
+                for event in batch.events:
+                    await write_event(conn, batch.source_id, event)
+    except Exception as e:
+        # TEMP 2026-08-06: ingest has been silently 500ing since 2026-08-03
+        # with nothing in the collector logs or wrangler tail to explain
+        # why. Surfacing the real exception in the response body until the
+        # root cause is found -- remove once fixed, this isn't meant to
+        # linger on a write endpoint the public collector calls.
+        raise HTTPException(500, f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}")
 
     return {"accepted": len(batch.events)}
 
