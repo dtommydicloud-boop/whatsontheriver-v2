@@ -805,13 +805,21 @@ async def admin_export(days: int = 45, x_admin_key: str = Header(default="")):
             ("derived_eta", "computed_at"),
         ):
             try:
+                # Real bug hit exporting this for the Railway migration: the
+                # pool's command_timeout=10 (set 2026-08-03 to stop hung
+                # queries from holding connections hostage) also silently
+                # killed this legitimate large export, with an empty
+                # exception string that made it look like nothing was even
+                # wrong. Override per-query with a longer timeout instead of
+                # touching the pool default that's protecting everything else.
                 rows = await conn.fetch(
                     f"SELECT * FROM {table} WHERE {time_col} > now() - make_interval(days => $1) ORDER BY {time_col}",
                     days,
+                    timeout=120,
                 )
                 out[table] = [_json_safe(r) for r in rows]
             except Exception as e:
-                out[table] = {"error": str(e)}
+                out[table] = {"error": repr(e)}
 
     return out
 
