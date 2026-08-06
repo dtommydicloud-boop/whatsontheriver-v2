@@ -663,10 +663,11 @@ async def ingest(request: Request, x_signature: str = Header(...)):
     except Exception as e:
         # TEMP 2026-08-06: ingest has been silently 500ing since 2026-08-03
         # with nothing in the collector logs or wrangler tail to explain
-        # why. Surfacing the real exception in the response body until the
-        # root cause is found -- remove once fixed, this isn't meant to
-        # linger on a write endpoint the public collector calls.
-        raise HTTPException(500, f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}")
+        # why. wrangler tail can't see inside the container process, so
+        # stash it in-memory for a gated debug read instead -- remove both
+        # once the root cause is found, this isn't meant to linger.
+        app.state.last_ingest_error = f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}"
+        raise HTTPException(500, "ingest failed")
 
     return {"accepted": len(batch.events)}
 
@@ -761,6 +762,15 @@ async def healthz():
 # this lets the running process force its own supervised restart -- picks
 # up fresh envVars from the DO constructor without touching the app
 # definition. Gated on ADMIN_RESTART_KEY so it's not a public kill switch.
+@app.get("/admin/last-ingest-error")
+async def admin_last_ingest_error(x_admin_key: str = Header(default="")):
+    # TEMP 2026-08-06, pairs with the in-memory stash in /ingest -- remove
+    # both once the silent-write-failure root cause is found and fixed.
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    return {"last_ingest_error": getattr(app.state, "last_ingest_error", None)}
+
+
 @app.post("/admin/restart")
 async def admin_restart(x_admin_key: str = Header(default="")):
     if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
