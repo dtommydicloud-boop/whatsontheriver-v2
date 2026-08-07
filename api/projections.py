@@ -616,8 +616,17 @@ async def compute_projected_tiers(conn, lock_meta, receivers, clean_name_fn, bea
             "callsign": None, "destination": None, "draught_m": None,
             "confidence": "medium" if stop_evidence else "low",
             "position_basis": position_basis,
-            "last_lock": {"lock_id": c["lock_id"], "name": meta["name"],
-                          "cleared_at": c["eol_at"].isoformat(), "age_h": round(c["age_h"], 2)},
+            # Real bug found live 2026-08-07 (Tom screenshot: "Departed
+            # undefined"): the frontend was already built against the
+            # source's exact last_lock field names (lock, endOfLockage,
+            # barges, lock_river_mile) -- this port used different names
+            # (name/cleared_at, and never included barges/lock_river_mile
+            # at all), so every lock-projected vessel's popup/tooltip
+            # showed "departed undefined" instead of a real lock name.
+            "last_lock": {"lock_id": c["lock_id"], "lock": meta["name"],
+                          "lock_river_mile": meta["river_mile"],
+                          "endOfLockage": c["eol_at"].isoformat(),
+                          "age_h": round(c["age_h"], 2), "barges": c["barges"]},
             "path_from_lock": path_pts_full,
         })
 
