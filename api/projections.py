@@ -35,6 +35,8 @@ import math
 import pathlib
 from datetime import datetime, timedelta, timezone
 
+from api import vessel_speed
+
 CHANNEL_PATH = pathlib.Path(__file__).parent / "data" / "pepin-channel.geojson"
 
 FRESH_CUTOFF_S = 300
@@ -519,12 +521,21 @@ async def compute_projected_tiers(conn, lock_meta, receivers, clean_name_fn, bea
                                      "vkey": vkey, "eol_at": r["eol_at"], "age_h": age_h}
 
     empirical_table = await _build_empirical_transit_table(conn, lock_meta)
+    await vessel_speed.ensure_fresh(conn, lock_meta)
 
     lock_projected = []
     for c in best_by_vessel.values():
         meta = lock_meta[c["lock_id"]]
         dir_sign = 1 if c["direction"] == "U" else -1
-        typical_mph = UPBOUND_MPH_TYPICAL if c["direction"] == "U" else DOWNBOUND_MPH_TYPICAL
+        direction_word = "upbound" if c["direction"] == "U" else "downbound"
+        # Per-vessel real speed database (Tom's ask, 2026-08-07): use HER OWN
+        # real cruising speed (converted to a lock-to-lock pace, see
+        # vessel_speed.py) when we have enough history on her, instead of
+        # blindly assuming the fleet-wide typical speed -- "just another
+        # tool", falls back to the fleet constant when we don't know her yet.
+        own_typical_mph = await vessel_speed.lookup(conn, c["vessel"], direction_word)
+        typical_mph = own_typical_mph if own_typical_mph is not None else (
+            UPBOUND_MPH_TYPICAL if c["direction"] == "U" else DOWNBOUND_MPH_TYPICAL)
         projected_rm, _locks, _min_ded, position_basis, overdue_unconfirmed = _project_rm_with_lockage(
             lock_meta, empirical_table, meta["river_mile"], dir_sign, c["age_h"], typical_mph,
             c["barges"], exclude_lock_id=c["lock_id"],
@@ -591,7 +602,8 @@ async def compute_projected_tiers(conn, lock_meta, receivers, clean_name_fn, bea
         lock_projected.append({
             "mmsi": None, "name": clean_name_fn(c["vessel"]),
             "lat": round(lat_show, 6), "lon": round(lon_show, 6),
-            "speed_mph": typical_mph, "cog_deg": None, "heading_deg": None,
+            "speed_mph": typical_mph, "speed_source": "vessel_history" if own_typical_mph is not None else "fleet_typical",
+            "cog_deg": None, "heading_deg": None,
             "shiptype": 57, "is_commercial": True,
             "last_signal_s": None, "is_live": False, "is_lock_projected": True,
             "capped_at_reception_boundary": capped_at_reception_boundary,

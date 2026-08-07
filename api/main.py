@@ -168,6 +168,31 @@ async def startup():
             );
             """
         )
+        # Real per-vessel speed database (Tom's ask, 2026-08-07): "once we
+        # see that boat again show up as a projection... we should have a
+        # better idea as to what speed it's probably gonna be driving at."
+        # Confirmed via analysis first (r=0.79 correlation between a
+        # vessel's real AIS cruising speed and her real lock-to-lock
+        # effective speed) before building this -- see vessel_speed.py.
+        # photo_url is unused today but reserved per Tom's ask ("we should
+        # have a picture in there") so this isn't a schema redesign later.
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vessel_speed_profile (
+                vessel_key          TEXT NOT NULL,
+                direction            TEXT NOT NULL,
+                display_name         TEXT,
+                typical_speed_mph    DOUBLE PRECISION,
+                ais_median_mph       DOUBLE PRECISION,
+                ais_sample_n         INTEGER NOT NULL DEFAULT 0,
+                own_ratio            DOUBLE PRECISION,
+                own_leg_sample_n     INTEGER NOT NULL DEFAULT 0,
+                photo_url            TEXT,
+                updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (vessel_key, direction)
+            );
+            """
+        )
 
 
 # --- Geo helpers, ported verbatim from Reed's live-positions.py/next-vessel.py ---
@@ -567,6 +592,23 @@ async def admin_last_vessel_eta_error(x_admin_key: str = Header(default="")):
     if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
         raise HTTPException(404)
     return {"last_vessel_eta_error": getattr(app.state, "last_vessel_eta_error", None)}
+
+
+@app.get("/admin/vessel-speed-profiles")
+async def admin_vessel_speed_profiles(x_admin_key: str = Header(default="")):
+    """Visibility into the real per-vessel speed database (Tom's ask,
+    2026-08-07) -- see vessel_speed.py."""
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    async with app.state.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT vessel_key, direction, display_name, typical_speed_mph, ais_median_mph,
+                   ais_sample_n, own_ratio, own_leg_sample_n, updated_at
+            FROM vessel_speed_profile ORDER BY ais_sample_n DESC
+            """
+        )
+    return {"count": len(rows), "profiles": [dict(r) for r in rows]}
 
 
 @app.get("/lock-status")
