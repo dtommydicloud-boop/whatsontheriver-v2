@@ -39,6 +39,7 @@ from pydantic import BaseModel, EmailStr
 
 from api import projections
 from api import replay as replay_mod
+from api import vessel_profile as vessel_profile_mod
 
 app = FastAPI(title="whatsontheriver API")
 
@@ -486,6 +487,25 @@ async def admin_last_replay_error(x_admin_key: str = Header(default="")):
     if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
         raise HTTPException(404)
     return {"last_replay_error": getattr(app.state, "last_replay_error", None)}
+
+
+@app.get("/vessel-profile")
+async def vessel_profile(vessel: str):
+    """Per-vessel lockage-history profile -- ported 2026-08-07 from Reed's
+    vessel-profile.py, see vessel_profile.py's module docstring."""
+    try:
+        async with app.state.pool.acquire() as conn:
+            return await vessel_profile_mod.build(conn, vessel)
+    except Exception as e:
+        app.state.last_vessel_profile_error = f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}"
+        raise HTTPException(500, "vessel-profile failed")
+
+
+@app.get("/admin/last-vessel-profile-error")
+async def admin_last_vessel_profile_error(x_admin_key: str = Header(default="")):
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    return {"last_vessel_profile_error": getattr(app.state, "last_vessel_profile_error", None)}
 
 
 @app.get("/lock-status")
