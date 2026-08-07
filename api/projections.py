@@ -387,7 +387,24 @@ async def compute_projected_tiers(conn, lock_meta, receivers, clean_name_fn, bea
     the caller's live-tier list. `conn` must be inside an active pool
     acquire(); `clean_name_fn`/`bearing_fn` reuse main.py's existing helpers
     so name-cleanup and bearing math stay identical across all three tiers.
+
+    Real bug found live via the old-vs-new comparator, 2026-08-07: main.py's
+    LOCK_META covers all 12 USACE locks (extended 2026-07-30 south to
+    Dubuque, RM 583-702, for /lock-status's data-only informational feed --
+    those locks are "data-only, NOT live AIS tracking" per the poller's own
+    comment). The source's live-positions.py has a SEPARATE, narrower
+    LOCK_TABLE for the lock-projected tier specifically -- just the 6 locks
+    inside our actual AIS-reception/calibrated corridor (01-05, 5A). Passing
+    the full 12-lock LOCK_META straight through here meant projecting
+    "vessels" forward from locks 100+ river-miles south of Lake Pepin,
+    outside any reception radius or empirical-transit calibration we have --
+    13 phantom lock-projected vessels appeared live the moment real traffic
+    cleared one of those southern locks. Restrict to the same 6-lock corridor
+    the source uses, regardless of what the caller's lock_meta covers.
     """
+    PROJECTION_CORRIDOR_LOCKS = {"01", "02", "03", "04", "05", "5A"}
+    lock_meta = {k: v for k, v in lock_meta.items() if k in PROJECTION_CORRIDOR_LOCKS}
+
     now = datetime.now(timezone.utc)
     now_ts = now.timestamp()
 
@@ -481,9 +498,10 @@ async def compute_projected_tiers(conn, lock_meta, receivers, clean_name_fn, bea
         WHERE eol_at IS NOT NULL
           AND eol_at > now() - make_interval(hours => $1)
           AND direction IN ('U', 'D')
+          AND lock_id = ANY($2::text[])
         ORDER BY eol_at DESC
         """,
-        LOCK_PROJECT_MAX_HOURS,
+        LOCK_PROJECT_MAX_HOURS, list(lock_meta.keys()),
         timeout=15,
     )
     best_by_vessel = {}
