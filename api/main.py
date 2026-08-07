@@ -37,7 +37,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 
-import projections
+from api import projections
 
 app = FastAPI(title="whatsontheriver API")
 
