@@ -106,6 +106,44 @@ def compose_reason(surface, surface_reason, lock, lock_reason, driver, bucket):
     return surface_reason
 
 
+LOCKAGE_HISTORY_DAYS = 7
+
+
+async def lockage_history_7d(conn):
+    """Real daily lockage counts, recreational vs commercial, last 7 days --
+    Tom's ask 2026-08-07 ("count the rec boats in the locks as a
+    barometer"): recreational lockages actually OUTNUMBER commercial ones
+    right now (711 vs 564 over a week, checked live) -- a real signal that
+    wasn't surfaced anywhere before this. Day boundaries in America/Chicago
+    so "today" lines up with when a user actually experiences it, not UTC
+    midnight. Same recreational check as main.py's _is_recreational (name
+    literal + raw_payload vessel_no), done in SQL since this is a simple
+    per-row classification over a bounded 7-day window, not worth a second
+    Python pass."""
+    rows = await conn.fetch(
+        """
+        SELECT (eol_at AT TIME ZONE 'America/Chicago')::date AS day,
+               CASE WHEN upper(vessel_name) LIKE '%RECREATION%'
+                      OR (raw_payload->>'vessel_no') = '9999999'
+                    THEN 'recreational' ELSE 'commercial' END AS kind,
+               count(*) AS n
+        FROM lock_status_observation
+        WHERE eol_at IS NOT NULL
+          AND eol_at > now() - make_interval(days => $1)
+        GROUP BY 1, 2
+        ORDER BY 1
+        """,
+        LOCKAGE_HISTORY_DAYS,
+        timeout=15,
+    )
+    by_day = {}
+    for r in rows:
+        d = r["day"].isoformat()
+        by_day.setdefault(d, {"date": d, "commercial": 0, "recreational": 0})
+        by_day[d][r["kind"]] = r["n"]
+    return sorted(by_day.values(), key=lambda x: x["date"])
+
+
 async def build(conn, compute_lock_status_data_fn):
     now = datetime.now(timezone.utc)
     surface, surface_detail, surface_reason = await surface_score(conn)
@@ -119,6 +157,7 @@ async def build(conn, compute_lock_status_data_fn):
     bucket = bucketize(score)
     reason_line = compose_reason(surface, surface_reason, lock, lock_reason, driver, bucket)
     divergence_pts = abs(surface - lock)
+    lockage_history = await lockage_history_7d(conn)
 
     dow = now.strftime("%A")
     baseline = {
@@ -139,6 +178,7 @@ async def build(conn, compute_lock_status_data_fn):
             "surface_traffic": {"score": round(surface), "detail": surface_detail, "reason": surface_reason},
             "lock_pressure": {"score": round(lock), "reason": lock_reason},
         },
+        "lockage_history_7d": lockage_history,
         "baseline": baseline,
         "day_of_week": dow,
         "hour_local": now.hour,
