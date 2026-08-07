@@ -149,6 +149,15 @@ async def build(conn, vessel_name):
         entry["count"] += 1
         entry[r["direction"]] += 1
 
+    # Pre-grouped, time-sorted end-times per (lock, direction) -- transit_events
+    # preserves her_rows' time order, so each group is already sorted and a
+    # 24h-window "does she reach the next lock" check can be a bisect lookup
+    # instead of an any(...) scan over every transit event (same O(n^2) class
+    # of bug as the old shuttle matcher, same fix shape).
+    ends_by_lock_dir = defaultdict(list)
+    for r in transit_events:
+        ends_by_lock_dir[(r["lock"], r["direction"])].append(r["end"])
+
     reach = {}
     rm_by_lock_name = {nm: rm for _, nm, rm in LOCK_ORDER}
     for lk_id, lk_nm, lk_rm in LOCK_ORDER:
@@ -164,13 +173,11 @@ async def build(conn, vessel_name):
             if not candidates:
                 continue
             next_lock = min(candidates, key=lambda nm: abs(rm_by_lock_name[nm] - lk_rm))
+            next_ends = ends_by_lock_dir.get((next_lock, direction_word), [])
             hits = 0
             for ev in dir_events:
-                matched = any(
-                    r["lock"] == next_lock and r["direction"] == direction_word
-                    and 0 <= (r["end"] - ev["end"]).total_seconds() / 3600.0 <= 24
-                    for r in transit_events
-                )
+                idx = bisect.bisect_left(next_ends, ev["end"])
+                matched = idx < len(next_ends) and (next_ends[idx] - ev["end"]).total_seconds() <= 24 * 3600.0
                 if matched:
                     hits += 1
             reach[f"{lk_nm}_{direction_word}"] = {
