@@ -14,14 +14,14 @@ same request. The queue abstraction (ingest/queue.py) still exists and
 this can grow into it the moment durability/backpressure actually
 matters -- boring and working now beats correct-on-paper and blocked.
 
-HONEST GAP, not silently faked: the current production API enriches
-lock-projected vessels with river-mile lookups, distance-from-receiver,
-and channel-snapped path_from_lock polylines -- that's real projection
-business logic living in Reed's existing next-vessel-server, not just
-stored data. This returns the fields this schema can genuinely answer
-and leaves the rest as explicit TODOs rather than fabricating
-plausible-looking numbers. Port that logic here before this is a real
-drop-in replacement, don't ship it silently missing.
+GAP CLOSED 2026-08-07: /live-positions now includes the dead-reckoned and
+lock-projected tiers too (see projections.py), ported from Reed's
+live-positions.py against this schema instead of his JSONL/LPMS-disk-cache
+data layer. Real edge cases preserved: reception-radius capping, grace-
+window overdue flagging, empirical-vs-physics leg-timing fallback,
+barge-class-segmented transit medians. This was a dual-run/shadow-compared
+port, not a guess -- see the comparator instrument used to verify it against
+the original before this replaced the live-only stub.
 """
 import hashlib
 import hmac
@@ -36,6 +36,8 @@ import asyncpg
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
+
+import projections
 
 app = FastAPI(title="whatsontheriver API")
 
@@ -225,22 +227,14 @@ def _clean_name(n):
 
 @app.get("/live-positions")
 async def live_positions():
-    """Field-parity pass 2026-08-02: real/live-tier vessels now carry the
-    full enrichment set the old next-vessel-server returns (speed_mph,
-    cog_deg, heading_deg, shiptype, is_commercial, distance/bearing_from_
-    receiver, river_mile, direction, callsign, destination, draught_m).
+    """Field-parity pass 2026-08-02: real/live-tier vessels carry the full
+    enrichment set the old next-vessel-server returns (speed_mph, cog_deg,
+    heading_deg, shiptype, is_commercial, distance/bearing_from_receiver,
+    river_mile, direction, callsign, destination, draught_m).
 
-    HONEST GAP still open, not silently faked: the dead-reckoned tier
-    (is_live=false, projected forward from a stale-but-recent real fix)
-    and the lock-projected tier (is_lock_projected=true, no AIS ever
-    heard but LPMS shows a departure heading our way -- position_basis/
-    leg_median_min/barge_class/frac_complete/confidence/last_lock) are
-    NOT ported yet. That's the single biggest remaining piece -- see
-    Reed's handoff notes on the bus for the exact source logic
-    (_project_rm_with_lockage, KNOWN_STOP_RATE, the empirical transit
-    model, the reception-radius/next-lock-ETA capping rules). Only
-    genuinely-live vessels (heard within FRESH_CUTOFF_S) show up here
-    until that lands -- no ghost/estimated markers yet.
+    Dead-reckoned + lock-projected tiers ported 2026-08-07 (see
+    projections.py for the real algorithm and its provenance) -- this
+    endpoint now shows the same three tiers the original server does.
     """
     now = datetime.now(timezone.utc)
     async with app.state.pool.acquire() as conn:
@@ -250,46 +244,53 @@ async def live_positions():
                    sog_mph, cog_deg, heading_deg, nav_status, shiptype, is_commercial,
                    callsign, destination, draught
             FROM vessel_current_state
+            WHERE last_seen > now() - interval '300 seconds'
             ORDER BY last_seen DESC
             """
         )
 
-    vessels = []
-    for r in rows:
-        age_s = (now - r["last_seen"]).total_seconds()
-        is_live = age_s < FRESH_CUTOFF_S
-        if not is_live:
-            # Dead-reckoned/lock-projected tiers not ported yet (see
-            # docstring) -- rather than show a stale dot in the wrong
-            # place, only genuinely-live vessels appear for now.
-            continue
+        vessels = []
+        for r in rows:
+            age_s = (now - r["last_seen"]).total_seconds()
+            lat, lon = r["last_lat"], r["last_lon"]
+            src = RECEIVERS.get(r["last_source_id"], RECEIVERS["lake_mac"])
+            direction = _dir_from_cog(r["cog_deg"])
+            river_mile = _lat_lon_to_rm(lat, lon) if lat is not None and lon is not None else None
 
-        lat, lon = r["last_lat"], r["last_lon"]
-        src = RECEIVERS.get(r["last_source_id"], RECEIVERS["lake_mac"])
-        direction = _dir_from_cog(r["cog_deg"])
-        river_mile = _lat_lon_to_rm(lat, lon) if lat is not None and lon is not None else None
+            vessels.append({
+                "mmsi": r["mmsi"],
+                "name": _clean_name(r["name"]),
+                "lat": round(lat, 6) if lat is not None else None,
+                "lon": round(lon, 6) if lon is not None else None,
+                "speed_mph": r["sog_mph"],
+                "cog_deg": round(r["cog_deg"], 1) if r["cog_deg"] is not None else None,
+                "heading_deg": r["heading_deg"],
+                "shiptype": r["shiptype"],
+                "is_commercial": r["is_commercial"],
+                "last_signal_s": age_s,
+                "is_live": True,
+                "heard_by": r["last_source_id"],
+                "distance_mi_from_receiver": round(_hav_mi(src["lat"], src["lon"], lat, lon), 2) if lat is not None else None,
+                "bearing_deg_from_receiver": round(_bearing_deg(src["lat"], src["lon"], lat, lon), 0) if lat is not None else None,
+                "river_mile": round(river_mile, 2) if river_mile is not None else None,
+                "direction": direction,
+                "callsign": r["callsign"] or None,
+                "destination": r["destination"] or None,
+                "draught_m": r["draught"],
+            })
 
-        vessels.append({
-            "mmsi": r["mmsi"],
-            "name": _clean_name(r["name"]),
-            "lat": round(lat, 6) if lat is not None else None,
-            "lon": round(lon, 6) if lon is not None else None,
-            "speed_mph": r["sog_mph"],
-            "cog_deg": round(r["cog_deg"], 1) if r["cog_deg"] is not None else None,
-            "heading_deg": r["heading_deg"],
-            "shiptype": r["shiptype"],
-            "is_commercial": r["is_commercial"],
-            "last_signal_s": age_s,
-            "is_live": is_live,
-            "heard_by": r["last_source_id"],
-            "distance_mi_from_receiver": round(_hav_mi(src["lat"], src["lon"], lat, lon), 2) if lat is not None else None,
-            "bearing_deg_from_receiver": round(_bearing_deg(src["lat"], src["lon"], lat, lon), 0) if lat is not None else None,
-            "river_mile": round(river_mile, 2) if river_mile is not None else None,
-            "direction": direction,
-            "callsign": r["callsign"] or None,
-            "destination": r["destination"] or None,
-            "draught_m": r["draught"],
-        })
+        try:
+            dead_reckoned, lock_projected = await projections.compute_projected_tiers(
+                conn, LOCK_META, RECEIVERS, _clean_name, _bearing_deg,
+            )
+            vessels.extend(dead_reckoned)
+            vessels.extend(lock_projected)
+        except Exception as e:
+            # Projection tiers are additive -- a bug in them should never take
+            # down the live tier, which is the one users actually depend on
+            # most. Real failure here is a real bug to go fix, not something
+            # to silently retry into looking fine.
+            app.state.last_projection_error = f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}"
 
     return {
         "generated_at": now.isoformat(),
@@ -792,6 +793,13 @@ async def admin_last_lock_status_error(x_admin_key: str = Header(default="")):
     if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
         raise HTTPException(404)
     return {"last_lock_status_error": getattr(app.state, "last_lock_status_error", None)}
+
+
+@app.get("/admin/last-projection-error")
+async def admin_last_projection_error(x_admin_key: str = Header(default="")):
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    return {"last_projection_error": getattr(app.state, "last_projection_error", None)}
 
 
 @app.post("/admin/restart")
