@@ -83,6 +83,18 @@ TRANSIT_MODELS = {
     ("03", "down_to_cabin", "small"): {"p10": 152.8, "med": 181.0, "p90": 605.8, "n": 5},
     ("03", "down_to_cabin", "big"):   {"p10": 163.0, "med": 242.9, "p90": 641.6, "n": 18},
 }
+# DIRECT = same data with fleeting outliers (transit > 6h) removed. Used by
+# vessel_eta.py for legs with no terminal/fleeting risk -- see that module.
+# Not used by /next-vessel itself (kept here alongside TRANSIT_MODELS since
+# both are the same cabin-correlation family of constants; vessel_eta.py
+# imports this module rather than duplicating them, same as the source's
+# vessel-eta.py imports next-vessel.py).
+TRANSIT_MODELS_DIRECT = {
+    ("04", "up_to_cabin", "small"):   {"p10": 130.5, "med": 167.4, "p90": 299.6, "n": 3},
+    ("04", "up_to_cabin", "big"):     {"p10": 220.3, "med": 251.8, "p90": 316.1, "n": 17},
+    ("03", "down_to_cabin", "small"): {"p10": 152.8, "med": 181.0, "p90": 211.8, "n": 4},
+    ("03", "down_to_cabin", "big"):   {"p10": 156.6, "med": 228.0, "p90": 263.2, "n": 7},
+}
 
 RED_WING_TERMINAL_RM = (789.0, 791.3)
 SHUTTLE_ROUNDTRIP_MAX_H = 3.0
@@ -253,7 +265,7 @@ async def _latest_position(conn, vessel_name, min_time=None):
     args = [vessel_name] + ([min_time] if min_time is not None else [])
     rows = await conn.fetch(
         f"""
-        SELECT time, lat, lon, sog_mph, cog_deg, name
+        SELECT time, lat, lon, sog_mph, cog_deg, name, is_commercial
         FROM vessel_position
         WHERE upper(trim(name)) = upper(trim($1)) {time_clause}
         ORDER BY time DESC LIMIT 5
@@ -265,7 +277,7 @@ async def _latest_position(conn, vessel_name, min_time=None):
             return r
     rows = await conn.fetch(
         f"""
-        SELECT time, lat, lon, sog_mph, cog_deg, name
+        SELECT time, lat, lon, sog_mph, cog_deg, name, is_commercial
         FROM vessel_position
         WHERE upper(regexp_replace(name, '[^A-Za-z0-9 ]', '', 'g'))
               LIKE '%' || upper(regexp_replace($1, '[^A-Za-z0-9 ]', '', 'g')) || '%'

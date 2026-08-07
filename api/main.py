@@ -40,6 +40,7 @@ from pydantic import BaseModel, EmailStr
 from api import next_vessel as next_vessel_mod
 from api import projections
 from api import replay as replay_mod
+from api import vessel_eta as vessel_eta_mod
 from api import vessel_profile as vessel_profile_mod
 from api import vessel_track as vessel_track_mod
 
@@ -547,6 +548,25 @@ async def admin_last_next_vessel_error(x_admin_key: str = Header(default="")):
     if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
         raise HTTPException(404)
     return {"last_next_vessel_error": getattr(app.state, "last_next_vessel_error", None)}
+
+
+@app.get("/vessel-eta")
+async def vessel_eta(vessel: str, lat: float, lon: float, cog: float = None):
+    """Per-vessel ETA to her next waypoint -- ported 2026-08-07 from Reed's
+    vessel-eta.py, see vessel_eta.py's module docstring."""
+    try:
+        async with app.state.pool.acquire() as conn:
+            return await vessel_eta_mod.build(conn, vessel, lat, lon, cog)
+    except Exception as e:
+        app.state.last_vessel_eta_error = f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}"
+        raise HTTPException(500, "vessel-eta failed")
+
+
+@app.get("/admin/last-vessel-eta-error")
+async def admin_last_vessel_eta_error(x_admin_key: str = Header(default="")):
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    return {"last_vessel_eta_error": getattr(app.state, "last_vessel_eta_error", None)}
 
 
 @app.get("/lock-status")
