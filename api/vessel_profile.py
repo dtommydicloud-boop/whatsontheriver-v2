@@ -40,11 +40,18 @@ def _clean_ais_name(nm):
 
 
 def _mark_shuttles(her_rows):
-    """Same rule as the source (same lock -- her_rows is already scoped to one
-    lock+vessel per row set here since callers pass rows across all locks, but
-    the opposite-direction-within-3h check only cares about her OWN rows, not
-    which lock -- unchanged from the source), rewritten from an O(n^2) full
-    pairwise scan to a sorted two-pointer window.
+    """Same-lock, opposite-direction, within 3h -- matching the source's real
+    rule (a shuttle is a round trip at ONE lock, not a same-vessel event at a
+    DIFFERENT lock nearby in time). Rewritten from an O(n^2) full pairwise
+    scan to a sorted two-pointer window.
+
+    Real bug found 2026-08-07 via a second-opinion code review: the original
+    version of this rewrite dropped the same-lock check entirely -- the
+    docstring claimed "same lock" but the code only checked direction+time
+    across ALL of her rows regardless of which lock, spanning all 6 locks in
+    her_rows. In practice this rarely fired wrong (a single real transit
+    clears every lock in the same direction), but it's a real correctness
+    gap against the stated rule, not just a doc/code mismatch.
 
     Real perf bug found testing this live: a common vessel name can match
     ~10K rows across the 6 locks, and the original nested loop compared every
@@ -68,10 +75,13 @@ def _mark_shuttles(her_rows):
         while right < n and (her_rows[right]["end"] - end_i).total_seconds() <= window_s:
             right += 1
         this_direction = her_rows[i]["direction"]
+        this_lock = her_rows[i]["lock_id"]
         is_shuttle = False
         for j in range(left, right):
             if j == i:
                 continue
+            if her_rows[j]["lock_id"] != this_lock:
+                continue  # different lock -- not a same-lock round trip
             if this_direction is not None and her_rows[j]["direction"] == this_direction:
                 continue  # same-direction double-cut, not a shuttle
             is_shuttle = True

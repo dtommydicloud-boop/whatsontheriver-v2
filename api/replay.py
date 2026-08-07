@@ -92,7 +92,18 @@ def _channel_slice_with_rm(from_rm, to_rm):
 async def _load_lock_clearances(conn, window_start, now):
     """{name_key: [{lock_id, t, rm}, ...]} sorted by time, for the 3 SIM_LOCKS,
     built from real lock_status_observation rows instead of the source's LPMS
-    disk cache. Same multi-cut collapse (same lock within SIM_DEDUP_HOURS)."""
+    disk cache. Same multi-cut collapse (same lock within SIM_DEDUP_HOURS).
+
+    Real bug found 2026-08-07 via a second-opinion code review: this query
+    had no lower time bound at all -- eol_at <= now with nothing else --
+    so every /replay call scanned the ENTIRE history of lock_status_observation
+    for the 3 sim locks regardless of the requested window (5h/24h/48h).
+    Bounded to window_start minus SIM_MAX_LEG_HOURS margin: a clearance pair
+    can straddle the window boundary (the first clearance just before
+    window_start, the segment still visible inside it), and SIM_MAX_LEG_HOURS
+    is the real cap _build_simulated_segments already applies to how long a
+    single leg can span, so that's the correct amount of lookback margin.
+    """
     rows = await conn.fetch(
         """
         SELECT lock_id, vessel_name, eol_at
@@ -100,9 +111,10 @@ async def _load_lock_clearances(conn, window_start, now):
         WHERE lock_id = ANY($1::text[])
           AND eol_at IS NOT NULL
           AND eol_at <= $2
+          AND eol_at >= $3
         ORDER BY vessel_name, eol_at
         """,
-        [lk for lk, _, _ in SIM_LOCKS], now,
+        [lk for lk, _, _ in SIM_LOCKS], now, window_start - timedelta(hours=SIM_MAX_LEG_HOURS),
         timeout=15,
     )
     by_vessel = {}

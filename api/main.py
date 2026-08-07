@@ -194,6 +194,28 @@ async def startup():
             );
             """
         )
+        # Real P0 bug found 2026-08-07 via a full second-opinion code review
+        # (super-search, both lanes): telemetry_raw's ONLY unique index was
+        # (source_id, dedupe_key, received_at) -- received_at is set fresh
+        # on every insert, so it can never actually collide, meaning
+        # ON CONFLICT DO NOTHING never fired. Combined with the collector's
+        # real spool-retry-on-timeout logic (a request that succeeded but
+        # whose response was lost still gets retried), this was silently
+        # writing real duplicate rows into telemetry_raw AND, since
+        # write_event() below unconditionally proceeded to the domain-table
+        # inserts regardless of whether telemetry_raw's insert was new,
+        # into vessel_position and lock_status_observation too -- confirmed
+        # live: 149,904 of 152,059 vessel_position rows and 538,509 of
+        # 545,142 lock_status_observation rows were exact-duplicate content
+        # (some single events duplicated 800-2,300+ times), cleaned up the
+        # same night this was found. This index is the real fix; write_event
+        # below now checks it explicitly before doing any domain writes.
+        await conn.execute(
+            "DROP INDEX IF EXISTS telemetry_raw_dedupe_idx"
+        )
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS telemetry_raw_source_dedupe_uq ON telemetry_raw (source_id, dedupe_key)"
+        )
 
 
 # --- Geo helpers, ported verbatim from Reed's live-positions.py/next-vessel.py ---
@@ -511,10 +533,27 @@ async def replay(hours: int = None):
         raise HTTPException(500, "replay failed")
 
 
+def _require_admin(x_admin_key: str):
+    # Real hardening 2026-08-07 (super-search review, both lanes flagged
+    # this): the old inline check compared against
+    # os.environ.get("ADMIN_RESTART_KEY", "__unset__") on every /admin/*
+    # route -- if the env var were ever unset (a deploy/config mistake),
+    # the literal string "__unset__" would become a valid, guessable admin
+    # key for export/schema-dump/prune/restart. Not currently exploitable
+    # (the real key IS set in Railway right now), but this closes the
+    # failure mode outright instead of depending on the env var always
+    # being present, and switches to hmac.compare_digest for the same
+    # timing-safety reason /ingest's signature check already uses it.
+    key = os.environ.get("ADMIN_RESTART_KEY")
+    if not key or len(key) < 24:
+        raise HTTPException(404)
+    if not x_admin_key or not hmac.compare_digest(x_admin_key, key):
+        raise HTTPException(404)
+
+
 @app.get("/admin/last-replay-error")
 async def admin_last_replay_error(x_admin_key: str = Header(default="")):
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     return {"last_replay_error": getattr(app.state, "last_replay_error", None)}
 
 
@@ -532,8 +571,7 @@ async def vessel_profile(vessel: str):
 
 @app.get("/admin/last-vessel-profile-error")
 async def admin_last_vessel_profile_error(x_admin_key: str = Header(default="")):
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     return {"last_vessel_profile_error": getattr(app.state, "last_vessel_profile_error", None)}
 
 
@@ -552,8 +590,7 @@ async def vessel_track(vessel: str, hours: float = None, project_hours: float = 
 
 @app.get("/admin/last-vessel-track-error")
 async def admin_last_vessel_track_error(x_admin_key: str = Header(default="")):
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     return {"last_vessel_track_error": getattr(app.state, "last_vessel_track_error", None)}
 
 
@@ -571,8 +608,7 @@ async def next_vessel(lat: float, lon: float):
 
 @app.get("/admin/last-next-vessel-error")
 async def admin_last_next_vessel_error(x_admin_key: str = Header(default="")):
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     return {"last_next_vessel_error": getattr(app.state, "last_next_vessel_error", None)}
 
 
@@ -590,8 +626,7 @@ async def vessel_eta(vessel: str, lat: float, lon: float, cog: float = None):
 
 @app.get("/admin/last-vessel-eta-error")
 async def admin_last_vessel_eta_error(x_admin_key: str = Header(default="")):
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     return {"last_vessel_eta_error": getattr(app.state, "last_vessel_eta_error", None)}
 
 
@@ -612,8 +647,7 @@ async def river_pulse(lat: float = None, lon: float = None):
 
 @app.get("/admin/last-river-pulse-error")
 async def admin_last_river_pulse_error(x_admin_key: str = Header(default="")):
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     return {"last_river_pulse_error": getattr(app.state, "last_river_pulse_error", None)}
 
 
@@ -621,8 +655,7 @@ async def admin_last_river_pulse_error(x_admin_key: str = Header(default="")):
 async def admin_vessel_speed_profiles(x_admin_key: str = Header(default="")):
     """Visibility into the real per-vessel speed database (Tom's ask,
     2026-08-07) -- see vessel_speed.py."""
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     async with app.state.pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -756,18 +789,44 @@ def _parse_dt(s: str | None) -> datetime | None:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
+MAX_OBSERVED_AT_FUTURE_S = 120
+
+
 async def write_event(conn: asyncpg.Connection, source_id: str, event: TelemetryEvent):
     observed_at = _parse_dt(event.observed_at)
-    await conn.execute(
+    # Real fix 2026-08-07 (super-search review): vessel_current_state and
+    # lock_live_state both use "WHERE EXCLUDED.last_seen > (or >=) table's
+    # own last_seen" to only accept genuinely-newer updates. A single event
+    # with a bogus far-future observed_at (bad collector clock, a payload
+    # bug) would win that comparison forever after and silently block every
+    # real, older-but-actually-current update from landing. Clamp rather
+    # than reject outright -- this is still a real event worth recording,
+    # just with an untrustworthy claimed timestamp.
+    if observed_at is not None:
+        now_utc = datetime.now(timezone.utc)
+        if (observed_at - now_utc).total_seconds() > MAX_OBSERVED_AT_FUTURE_S:
+            observed_at = now_utc
+    # Real P0 fix 2026-08-07: ON CONFLICT DO NOTHING silently did nothing
+    # useful here (see the index comment above) AND, even after fixing the
+    # index, this insert alone never stopped the domain-table writes below
+    # from running unconditionally on every call -- a retried signed batch
+    # (collector's spool_retry_loop genuinely does this on a lost response)
+    # would duplicate real rows into vessel_position/lock_status_observation
+    # even with a working telemetry_raw dedupe. Check the command tag for a
+    # genuine insert (xmax/rowcount via the "INSERT 0 N" tag) and skip all
+    # domain writes when N == 0 -- this exact event was already processed.
+    tag = await conn.execute(
         """
         INSERT INTO telemetry_raw (observed_at, source_id, event_type,
                                     schema_version, dedupe_key, raw_payload)
         VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT DO NOTHING
+        ON CONFLICT (source_id, dedupe_key) DO NOTHING
         """,
         observed_at, source_id, event.event_type,
         event.schema_version, event.dedupe_key, json.dumps(event.payload),
     )
+    if tag.endswith(" 0"):
+        return  # already processed this exact event -- domain tables already have it
 
     if event.event_type == "ais_position":
         p = event.payload
@@ -838,10 +897,27 @@ async def write_event(conn: asyncpg.Connection, source_id: str, event: Telemetry
         )
 
 
+MAX_INGEST_BODY_BYTES = 512 * 1024
+MAX_INGEST_EVENTS = 500
+
+
 @app.post("/ingest")
 async def ingest(request: Request, x_signature: str = Header(...)):
+    # Real hardening 2026-08-07 (super-search review, OWASP API4:2023
+    # unrestricted-resource-consumption): body must be size-capped BEFORE
+    # any parsing. Note the real constraint this doesn't fully solve --
+    # verify_signature() is keyed by source_id, which only exists INSIDE
+    # the signed body, so a genuinely parse-before-auth design would need
+    # the collector to also send source_id in a header. That's a real
+    # protocol change (touches Reed's collector too), not done tonight --
+    # this size cap closes the actual DoS surface (forcing expensive
+    # unbounded parse/validation work) without needing that bigger change.
     body = await request.body()
+    if len(body) > MAX_INGEST_BODY_BYTES:
+        raise HTTPException(413, "payload too large")
     batch = Batch.model_validate_json(body)
+    if len(batch.events) > MAX_INGEST_EVENTS:
+        raise HTTPException(413, "too many events in one batch")
 
     if not verify_signature(batch.source_id, body, x_signature):
         raise HTTPException(401, "bad signature")
@@ -967,29 +1043,25 @@ async def healthz():
 async def admin_last_ingest_error(x_admin_key: str = Header(default="")):
     # TEMP 2026-08-06, pairs with the in-memory stash in /ingest -- remove
     # both once the silent-write-failure root cause is found and fixed.
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     return {"last_ingest_error": getattr(app.state, "last_ingest_error", None)}
 
 
 @app.get("/admin/last-lock-status-error")
 async def admin_last_lock_status_error(x_admin_key: str = Header(default="")):
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     return {"last_lock_status_error": getattr(app.state, "last_lock_status_error", None)}
 
 
 @app.get("/admin/last-projection-error")
 async def admin_last_projection_error(x_admin_key: str = Header(default="")):
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     return {"last_projection_error": getattr(app.state, "last_projection_error", None)}
 
 
 @app.post("/admin/restart")
 async def admin_restart(x_admin_key: str = Header(default="")):
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     os._exit(1)
 
 
@@ -1019,8 +1091,7 @@ def _json_safe(row):
 
 @app.get("/admin/export")
 async def admin_export(days: int = 45, x_admin_key: str = Header(default="")):
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
 
     out = {}
     async with app.state.pool.acquire() as conn:
@@ -1055,8 +1126,7 @@ async def admin_export_table(
     # 45-day pull -- HTTP 500 with a tiny body, no useful error surfaced.
     # This exports ONE table over a bounded day-window per call so a driver
     # script can walk the full range in safe slices instead.
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     if table not in _EXPORT_HYPERTABLES:
         raise HTTPException(400, f"table must be one of {list(_EXPORT_HYPERTABLES)}")
     if since_days_ago <= until_days_ago:
@@ -1087,8 +1157,7 @@ async def admin_prune_telemetry_raw(older_than_days: int = 20, x_admin_key: str 
     # logic (those read vessel_position / lock_status_observation directly) --
     # so it's the safe thing to prune to get writes flowing again right now,
     # while the real fix (Railway migration, no 512MB cap) finishes.
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     if older_than_days < 0:
         raise HTTPException(400, "older_than_days must be >= 0")
     async with app.state.pool.acquire() as conn:
@@ -1112,8 +1181,7 @@ async def admin_live_schema(x_admin_key: str = Header(default="")):
     # was never added to it, created ad hoc directly on Neon) so pull the
     # real live schema straight from information_schema instead of
     # reconstructing it by hand from scattered SQL files.
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     async with app.state.pool.acquire() as conn:
         cols = await conn.fetch(
             """
@@ -1155,8 +1223,7 @@ async def admin_live_schema(x_admin_key: str = Header(default="")):
 
 @app.get("/admin/table-counts")
 async def admin_table_counts(x_admin_key: str = Header(default="")):
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     tables = ["sources", "telemetry_raw", "vessel_position", "lock_status_observation",
               "vessel_current_state", "derived_eta", "email_signups", "photo_submissions",
               "lock_live_state"]
@@ -1172,8 +1239,7 @@ async def admin_table_counts(x_admin_key: str = Header(default="")):
 
 @app.get("/admin/export-table-range")
 async def admin_export_table_range(table: str, x_admin_key: str = Header(default="")):
-    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
-        raise HTTPException(404)
+    _require_admin(x_admin_key)
     if table not in _EXPORT_HYPERTABLES:
         raise HTTPException(400, f"table must be one of {list(_EXPORT_HYPERTABLES)}")
     time_col = _EXPORT_HYPERTABLES[table]
