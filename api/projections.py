@@ -168,6 +168,22 @@ def _name_key(n):
     return (n or "").strip().upper()
 
 
+def _is_recreational(vessel_name, raw_payload):
+    """Same check as main.py's _is_recreational (name literal + payload
+    vessel_no) -- duplicated locally rather than imported to avoid a
+    main<->projections circular import, same pattern as every other
+    per-module recreational check in this codebase."""
+    if "RECREATION" in (vessel_name or "").upper():
+        return True
+    try:
+        payload = json.loads(raw_payload) if isinstance(raw_payload, str) else (raw_payload or {})
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("vessel_no") == "9999999"
+
+
 # --- Empirical leg-transit table (ported; queries lock_status_observation
 # instead of an LPMS disk cache -- same methodology, real Postgres source) --
 
@@ -375,6 +391,25 @@ async def compute_projected_tiers(conn, lock_meta, receivers, clean_name_fn, bea
     now = datetime.now(timezone.utc)
     now_ts = now.timestamp()
 
+    # Names to exclude from lock-projection because we've heard them on AIS
+    # at all recently (live OR dead-reckoned -- ANY freshness, not just the
+    # dead-reckon candidate window below). Real bug found via the old-vs-new
+    # shadow comparator, 2026-08-07: this used to be derived only from
+    # dr_rows (300s-2h stale), so a genuinely LIVE vessel (<300s) was never
+    # added to the exclusion set and could show up in BOTH the live tier AND
+    # lock_projected simultaneously (confirmed live: Viking Mississippi in
+    # both). The source's own ais_vessel_keys is built from the FULL vessel
+    # history dict (every AIS tier), not just the dead-reckon subset -- match
+    # that here with a separate, wider query.
+    ais_name_rows = await conn.fetch(
+        """
+        SELECT DISTINCT name FROM vessel_current_state
+        WHERE last_seen > now() - interval '2 hours' AND name IS NOT NULL
+        """,
+        timeout=15,
+    )
+    ais_vessel_keys = {_name_key(r["name"]) for r in ais_name_rows if r["name"]}
+
     # Candidates for dead-reckoning: vessel_current_state rows stale for the
     # live tier but within the 2h dead-reckon window, moving fast enough to
     # be worth projecting.
@@ -391,10 +426,7 @@ async def compute_projected_tiers(conn, lock_meta, receivers, clean_name_fn, bea
     )
 
     dead_reckoned = []
-    ais_vessel_keys = set()
     for r in dr_rows:
-        if r["name"]:
-            ais_vessel_keys.add(_name_key(r["name"]))
         age_s = (now - r["last_seen"]).total_seconds()
         if age_s < 0:
             age_s = 0
@@ -434,9 +466,17 @@ async def compute_projected_tiers(conn, lock_meta, receivers, clean_name_fn, bea
 
     # Lock-projected candidates: recent lock departures (LPMS) for a vessel
     # we haven't heard on AIS recently.
+    #
+    # Real gap found via the old-vs-new shadow comparator, 2026-08-07: this
+    # query had NO recreational-vessel exclusion at all, unlike every other
+    # lock_status_observation query in this codebase (main.py's
+    # _is_recreational, vessel_profile.py, replay.py's _load_lock_clearances)
+    # and unlike the source's own _fetch_lock_departures_recent (vesselNo ==
+    # "9999999" or "RECREATION" in name). An anonymized recreational lockage
+    # could get projected forward as if she were a real commercial tow.
     dep_rows = await conn.fetch(
         """
-        SELECT lock_id, vessel_name, direction, barges, eol_at
+        SELECT lock_id, vessel_name, direction, barges, eol_at, raw_payload
         FROM lock_status_observation
         WHERE eol_at IS NOT NULL
           AND eol_at > now() - make_interval(hours => $1)
@@ -448,6 +488,8 @@ async def compute_projected_tiers(conn, lock_meta, receivers, clean_name_fn, bea
     )
     best_by_vessel = {}
     for r in dep_rows:
+        if _is_recreational(r["vessel_name"], r["raw_payload"]):
+            continue
         vkey = _name_key(r["vessel_name"])
         if vkey in ais_vessel_keys:
             continue
