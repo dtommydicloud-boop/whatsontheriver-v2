@@ -38,6 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 
 from api import projections
+from api import replay as replay_mod
 
 app = FastAPI(title="whatsontheriver API")
 
@@ -465,6 +466,26 @@ def _build_badge_and_line(name, live_state, flag, active_barges, driver, active,
             line = f"{name} — clear. No recent commercial activity."
 
     return badge, line
+
+
+@app.get("/replay")
+async def replay(hours: int = None):
+    """Compressed vessel-track playback -- ported 2026-08-07 from Reed's
+    replay.py, see replay.py's module docstring for the real port notes.
+    """
+    try:
+        async with app.state.pool.acquire() as conn:
+            return await replay_mod.build(conn, RECEIVERS, window_hours=hours)
+    except Exception as e:
+        app.state.last_replay_error = f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}"
+        raise HTTPException(500, "replay failed")
+
+
+@app.get("/admin/last-replay-error")
+async def admin_last_replay_error(x_admin_key: str = Header(default="")):
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    return {"last_replay_error": getattr(app.state, "last_replay_error", None)}
 
 
 @app.get("/lock-status")
