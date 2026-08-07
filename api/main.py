@@ -37,6 +37,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 
+from api import next_vessel as next_vessel_mod
 from api import projections
 from api import replay as replay_mod
 from api import vessel_profile as vessel_profile_mod
@@ -527,6 +528,25 @@ async def admin_last_vessel_track_error(x_admin_key: str = Header(default="")):
     if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
         raise HTTPException(404)
     return {"last_vessel_track_error": getattr(app.state, "last_vessel_track_error", None)}
+
+
+@app.get("/next-vessel")
+async def next_vessel(lat: float, lon: float):
+    """Cabin-anchored next-tow ETA prediction -- ported 2026-08-07 from
+    Reed's next-vessel.py, see next_vessel.py's module docstring."""
+    try:
+        async with app.state.pool.acquire() as conn:
+            return await next_vessel_mod.build(conn, lat, lon)
+    except Exception as e:
+        app.state.last_next_vessel_error = f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}"
+        raise HTTPException(500, "next-vessel failed")
+
+
+@app.get("/admin/last-next-vessel-error")
+async def admin_last_next_vessel_error(x_admin_key: str = Header(default="")):
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    return {"last_next_vessel_error": getattr(app.state, "last_next_vessel_error", None)}
 
 
 @app.get("/lock-status")
