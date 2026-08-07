@@ -40,6 +40,7 @@ from pydantic import BaseModel, EmailStr
 from api import next_vessel as next_vessel_mod
 from api import projections
 from api import replay as replay_mod
+from api import river_pulse as river_pulse_mod
 from api import vessel_eta as vessel_eta_mod
 from api import vessel_profile as vessel_profile_mod
 from api import vessel_track as vessel_track_mod
@@ -594,6 +595,28 @@ async def admin_last_vessel_eta_error(x_admin_key: str = Header(default="")):
     return {"last_vessel_eta_error": getattr(app.state, "last_vessel_eta_error", None)}
 
 
+@app.get("/river-pulse")
+async def river_pulse(lat: float = None, lon: float = None):
+    """How-busy-is-the-river composite gauge -- ported 2026-08-07 from
+    Reed's river-pulse.py, see river_pulse.py's module docstring. lat/lon
+    accepted for URL-shape parity with the frontend's existing call (see
+    index.html) but unused -- same as the source, which also ignores them
+    (score is reach-wide, not per-point)."""
+    try:
+        async with app.state.pool.acquire() as conn:
+            return await river_pulse_mod.build(conn, _compute_lock_status_data)
+    except Exception as e:
+        app.state.last_river_pulse_error = f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}"
+        raise HTTPException(500, "river-pulse failed")
+
+
+@app.get("/admin/last-river-pulse-error")
+async def admin_last_river_pulse_error(x_admin_key: str = Header(default="")):
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    return {"last_river_pulse_error": getattr(app.state, "last_river_pulse_error", None)}
+
+
 @app.get("/admin/vessel-speed-profiles")
 async def admin_vessel_speed_profiles(x_admin_key: str = Header(default="")):
     """Visibility into the real per-vessel speed database (Tom's ask,
@@ -611,43 +634,36 @@ async def admin_vessel_speed_profiles(x_admin_key: str = Header(default="")):
     return {"count": len(rows), "profiles": [dict(r) for r in rows]}
 
 
-@app.get("/lock-status")
-async def lock_status():
-    """Field-parity pass 2026-08-02: 4-tier flag/badge/conditions_line
-    logic ported verbatim from Reed's lock-status.py (see functions
-    above). Reads per-transit rows from lock_status_observation (the
-    queue-row equivalent) plus the live pending/locking/delay/throughput
-    snapshot from lock_live_state -- both now sent by Reed's collector
-    (added 2026-08-02 specifically for this port)."""
+async def _compute_lock_status_data(conn):
+    """Shared by /lock-status and river_pulse.py (both need the same
+    per-lock flag/live_state data) -- extracted 2026-08-07 so river-pulse's
+    port doesn't re-derive this from scratch. Field-parity pass 2026-08-02:
+    4-tier flag/badge/conditions_line logic ported verbatim from Reed's
+    lock-status.py (see functions above). Reads per-transit rows from
+    lock_status_observation (the queue-row equivalent) plus the live
+    pending/locking/delay/throughput snapshot from lock_live_state -- both
+    now sent by Reed's collector (added 2026-08-02 specifically for this
+    port)."""
     now = datetime.now(timezone.utc)
-    try:
-        async with app.state.pool.acquire() as conn:
-            # Real timeout found live 2026-08-06: this table is ~509K rows
-            # now and the (lock_id, time DESC) ORDER BY doesn't line up with
-            # either index cleanly (one covers the WHERE, the other the
-            # ORDER BY), so the sort + Neon's occasional scale-to-zero wake
-            # latency together were blowing past the pool's 10s
-            # command_timeout. Same per-query override already used for
-            # /admin/export -- doesn't touch the pool-wide default.
-            obs_rows = await conn.fetch(
-                """
-                SELECT lock_id, vessel_name, barges, direction, sol_at, eol_at, raw_payload
-                FROM lock_status_observation
-                WHERE time > now() - interval '30 days'
-                ORDER BY lock_id, time DESC
-                """,
-                timeout=30,
-            )
-            live_rows = await conn.fetch(
-                "SELECT lock_id, pending, locking, delay24h_min, throughput_24h FROM lock_live_state",
-                timeout=15,
-            )
-    except Exception as e:
-        # TEMP 2026-08-06: /lock-status started 500ing/hanging on live prod
-        # mid-migration-work -- same stash-and-read pattern as /ingest's
-        # debug endpoint, remove once root cause is found and fixed.
-        app.state.last_lock_status_error = f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}"
-        raise HTTPException(500, "lock-status failed")
+    # Real timeout found live 2026-08-06: this table is ~509K rows now and
+    # the (lock_id, time DESC) ORDER BY doesn't line up with either index
+    # cleanly (one covers the WHERE, the other the ORDER BY), so the sort +
+    # Neon's occasional scale-to-zero wake latency together were blowing
+    # past the pool's 10s command_timeout. Same per-query override already
+    # used for /admin/export -- doesn't touch the pool-wide default.
+    obs_rows = await conn.fetch(
+        """
+        SELECT lock_id, vessel_name, barges, direction, sol_at, eol_at, raw_payload
+        FROM lock_status_observation
+        WHERE time > now() - interval '30 days'
+        ORDER BY lock_id, time DESC
+        """,
+        timeout=30,
+    )
+    live_rows = await conn.fetch(
+        "SELECT lock_id, pending, locking, delay24h_min, throughput_24h FROM lock_live_state",
+        timeout=15,
+    )
 
     rows_by_lock: dict[str, list] = {}
     for r in obs_rows:
@@ -691,6 +707,19 @@ async def lock_status():
         }
 
     return {"generated_at": now.isoformat(), "locks": locks}
+
+
+@app.get("/lock-status")
+async def lock_status():
+    try:
+        async with app.state.pool.acquire() as conn:
+            return await _compute_lock_status_data(conn)
+    except Exception as e:
+        # TEMP 2026-08-06: /lock-status started 500ing/hanging on live prod
+        # mid-migration-work -- same stash-and-read pattern as /ingest's
+        # debug endpoint, remove once root cause is found and fixed.
+        app.state.last_lock_status_error = f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}"
+        raise HTTPException(500, "lock-status failed")
 
 
 # --- Ingest ------------------------------------------------------------
