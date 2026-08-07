@@ -328,6 +328,17 @@ def _is_recreational(vessel_name, raw_payload):
         payload = json.loads(raw_payload) if isinstance(raw_payload, str) else (raw_payload or {})
     except (TypeError, ValueError):
         payload = {}
+    # Real bug found live 2026-08-07: at least one historical row has a
+    # double-JSON-encoded raw_payload (a string that itself decodes to a
+    # string, not a dict), which crashed every /lock-status request with
+    # 'str' object has no attribute 'get'. The isinstance guard above only
+    # catches raw_payload arriving as a string; it doesn't catch the
+    # PARSED result also being a non-dict. Not worth silently swallowing
+    # bad data forever, but not worth 500ing the whole endpoint over one
+    # malformed historical row either -- treat a non-dict payload as "not
+    # recreational" rather than crash.
+    if not isinstance(payload, dict):
+        return False
     return payload.get("vessel_no") == "9999999"
 
 
