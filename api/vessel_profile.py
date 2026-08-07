@@ -12,6 +12,8 @@ opposite direction, within SHUTTLE_ROUNDTRIP_MAX_H), and reach-through-%
 for her two most common transit legs (does she keep going past the next
 lock within 24h, or tend to stop/turn around here).
 """
+import bisect
+from collections import defaultdict
 from datetime import datetime, timezone
 
 SHUTTLE_ROUNDTRIP_MAX_H = 3.0
@@ -37,16 +39,44 @@ def _clean_ais_name(nm):
     return " ".join(parts)
 
 
-def _is_local_shuttle(end_time, her_other_rows, exclude_idx, this_direction):
-    for i, r in enumerate(her_other_rows):
-        if i == exclude_idx:
-            continue
-        if this_direction is not None and r["direction"] == this_direction:
-            continue  # same-direction double-cut, not a shuttle
-        gap_h = abs((r["end"] - end_time).total_seconds()) / 3600.0
-        if gap_h <= SHUTTLE_ROUNDTRIP_MAX_H:
-            return True
-    return False
+def _mark_shuttles(her_rows):
+    """Same rule as the source (same lock -- her_rows is already scoped to one
+    lock+vessel per row set here since callers pass rows across all locks, but
+    the opposite-direction-within-3h check only cares about her OWN rows, not
+    which lock -- unchanged from the source), rewritten from an O(n^2) full
+    pairwise scan to a sorted two-pointer window.
+
+    Real perf bug found testing this live: a common vessel name can match
+    ~10K rows across the 6 locks, and the original nested loop compared every
+    row against every other row (~100M comparisons) -- measured 13s total
+    request time in production despite the SQL itself running in ~9ms
+    (confirmed via EXPLAIN ANALYZE). her_rows arrives already sorted by `end`
+    (the query's ORDER BY eol_at, preserved through the Python filter above),
+    so for each row only a small window of rows within +/-3h can possibly
+    match -- no need to scan the whole list.
+    """
+    n = len(her_rows)
+    left = 0
+    right = 0
+    window_s = SHUTTLE_ROUNDTRIP_MAX_H * 3600.0
+    for i in range(n):
+        end_i = her_rows[i]["end"]
+        while left < n and (end_i - her_rows[left]["end"]).total_seconds() > window_s:
+            left += 1
+        if right < left:
+            right = left
+        while right < n and (her_rows[right]["end"] - end_i).total_seconds() <= window_s:
+            right += 1
+        this_direction = her_rows[i]["direction"]
+        is_shuttle = False
+        for j in range(left, right):
+            if j == i:
+                continue
+            if this_direction is not None and her_rows[j]["direction"] == this_direction:
+                continue  # same-direction double-cut, not a shuttle
+            is_shuttle = True
+            break
+        her_rows[i]["is_shuttle"] = is_shuttle
 
 
 async def build(conn, vessel_name):
@@ -93,10 +123,9 @@ async def build(conn, vessel_name):
             "end": r["eol_at"], "barges": r["barges"] or 0,
         })
 
-    for i, r in enumerate(her_rows):
-        r["is_shuttle"] = _is_local_shuttle(r["end"], her_rows, i, r["direction"])
-
-    her_rows.sort(key=lambda r: r["end"])
+    # her_rows is already time-sorted (query ORDER BY eol_at, preserved
+    # through the filter loop above) -- _mark_shuttles relies on that order.
+    _mark_shuttles(her_rows)
 
     if not her_rows:
         return {
