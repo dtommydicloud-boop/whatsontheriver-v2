@@ -40,6 +40,7 @@ from pydantic import BaseModel, EmailStr
 from api import projections
 from api import replay as replay_mod
 from api import vessel_profile as vessel_profile_mod
+from api import vessel_track as vessel_track_mod
 
 app = FastAPI(title="whatsontheriver API")
 
@@ -506,6 +507,26 @@ async def admin_last_vessel_profile_error(x_admin_key: str = Header(default=""))
     if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
         raise HTTPException(404)
     return {"last_vessel_profile_error": getattr(app.state, "last_vessel_profile_error", None)}
+
+
+@app.get("/vessel-track")
+async def vessel_track(vessel: str, hours: float = None, project_hours: float = None):
+    """Real breadcrumb trail + channel-snapped projection for one vessel --
+    ported 2026-08-07 from Reed's vessel-track.py, see vessel_track.py's
+    module docstring."""
+    try:
+        async with app.state.pool.acquire() as conn:
+            return await vessel_track_mod.build(conn, vessel, hours_back=hours, project_hours=project_hours)
+    except Exception as e:
+        app.state.last_vessel_track_error = f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}"
+        raise HTTPException(500, "vessel-track failed")
+
+
+@app.get("/admin/last-vessel-track-error")
+async def admin_last_vessel_track_error(x_admin_key: str = Header(default="")):
+    if not x_admin_key or x_admin_key != os.environ.get("ADMIN_RESTART_KEY", "__unset__"):
+        raise HTTPException(404)
+    return {"last_vessel_track_error": getattr(app.state, "last_vessel_track_error", None)}
 
 
 @app.get("/lock-status")
